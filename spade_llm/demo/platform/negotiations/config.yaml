@@ -23,6 +23,10 @@ agents:
     type_name: spade_llm.demo.platform.negotiations.agents.MerchantAgent
     args:
       model: max
+  competitor:
+    type_name: spade_llm.demo.platform.negotiations.agents.CompetitorAgent
+    args:
+      model: max
   # Console agent which listens for commands from console and sends them to the delegate agent
   console:
     type_name: spade_llm.agents.console.ConsoleAgent
