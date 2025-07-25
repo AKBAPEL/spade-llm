@@ -102,7 +102,7 @@ class PlatformAgent(Agent, Configurable[PlatformAgentConf]):
             # Wait for response
             receiver = await self.receive(
                 MessageTemplate(self.context.thread_id),
-                timeout=25
+                timeout=60
             )
 
             # Parse response
@@ -118,52 +118,45 @@ class PlatformAgent(Agent, Configurable[PlatformAgentConf]):
                 await self.context.reply_with_inform(self.message).with_content(
                     f"Total price: {response.total_price} rub"
                 )
+            self.set_is_done()
 
     def setup(self):
         self.add_behaviour(self.ShoplistRequestBehaviour(self.config))
+
+
+"""
+
+Communication agents
+
+"""
 
 
 class MerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
 
 
-class ConversationBehaviour(ContextBehaviour):
-    def __init__(self, context: AgentContext, config: MerchantAgentConf, missing_ingredients: List[str]):
-        super().__init__(context)
-        self.config = config
-        self.missing_ingredients = missing_ingredients
-
-    async def step(self):
-        request = ShopListRequest(ingredients=self.missing_ingredients)
-
-        # Send request
-        await (self.context.request("competitor")
-               .with_content(request))
-
-        self.set_is_done()
-
-
 @configuration(MerchantAgentConf)
 class MerchantAgent(Agent, Configurable[MerchantAgentConf]):
-    class HandleRequestBehaviour(MessageHandlingBehavior):
-        shop_sku = {
-            "мясо (говядина)": 320,
-            "свёкла": 50,
-            "морковь": 30,
-            "лук репчатый": 20,
-            "капуста белокочанная": 80,
-            "картофель": 40,
-            "томатная паста": 35,
-            "чеснок": 15,
-            "уксус (лимонный сок)": 10,
-            "лавровый лист": 5,
-            "соль, перец": 10,
-            "зелень (укроп/петрушка)": 25,
-            #     "сметана": 60
-            # }
-        }
+    shop_sku = {
+        "мясо (говядина)": 320,
+        "свёкла": 50,
+        "морковь": 30,
+        "лук репчатый": 20,
+        "капуста белокочанная": 80,
+        "картофель": 40,
+        "томатная паста": 35,
+        "чеснок": 15,
+        "уксус (лимонный сок)": 10,
+        "лавровый лист": 5,
+        "соль, перец": 10,
+        "зелень (укроп/петрушка)": 25,
+        #     "сметана": 60
+        # }
+    }
 
-        def __init__(self, config: MerchantAgentConf,model: BaseChatModel):
+    class HandleRequestBehaviour(MessageHandlingBehavior):
+
+        def __init__(self, config: MerchantAgentConf, model: BaseChatModel):
             super().__init__(MessageTemplate.request())
             self.config = config
             self.model = model
@@ -177,77 +170,90 @@ class MerchantAgent(Agent, Configurable[MerchantAgentConf]):
             missing_ingredients = []
 
             for ingredient in request.ingredients:
-                if ingredient in self.shop_sku:
+                if ingredient in self.agent.shop_sku:
                     available_ingredients.append(ingredient)
                 else:
                     missing_ingredients.append(ingredient)
 
             # Calculate total price for available ingredients
             total_price = sum(
-                self.shop_sku.get(ingredient, 0)
+                self.agent.shop_sku.get(ingredient, 0)
                 for ingredient in available_ingredients
             )
-            print("_____", missing_ingredients)
+
             final_missing = []
 
             if missing_ingredients:
-                conversation = ConversationBehaviour(self.context, self.config, missing_ingredients)
-                self.agent.add_behaviour(conversation)
-                await conversation.join()
-                competitor_response = await self.receive(template=MessageTemplate(thread_id=self.context.thread_id),
-                                                         timeout=25)
-                print(7777,competitor_response)
-                try:
-                    competitor_response = ShopList.model_validate_json(competitor_response.content)
-                except ValidationError:
-                    competitor_response = Conversate.model_validate_json(competitor_response.content)
+                request = ShopListRequest(ingredients=missing_ingredients)
+                thread = await self.context.fork_thread() # ВАЖНО! Для каждого агента свой тред
+                # Send request
+                await (thread.request("competitor")
+                       .with_content(request))
+                message_history = []
+                # TODO: For i < self.max_iterations:
+                # Probably should be fork thread for communication with each agent
+                j = 0
+                while True:
+                    print(f"                 ITERATION IS {j}")
+                    j+=1
 
-                if isinstance(competitor_response, ShopList):
-                    for ingredient in missing_ingredients:
-                        if ingredient not in competitor_response.ingredients.keys():
-                            final_missing.append(ingredient)
-                        else:
-                            total_price += competitor_response.ingredients[ingredient]
-                    missing_ingredients.clear()
-                elif isinstance(competitor_response, Conversate):
-                    negotiation_prompt = ChatPromptTemplate.from_template(
-                        """Ты - агент основного магазина. Ты получил контрпредложение от конкурента на недостающие ингредиенты. 
-                        Твоя цель - получить необходимые товары на выгодных условиях, но ты можешь пойти на разумные уступки.
+                    competitor_response = await self.receive(template=MessageTemplate(thread_id=thread.thread_id),
+                                                             timeout=60)
+                    print("\nNOW RESPONSE IS\n",competitor_response.content)
+                    try:
+                        competitor_response = ShopList.model_validate_json(competitor_response.content)
+                    except ValidationError:
+                        competitor_response = Conversate.model_validate_json(competitor_response.content)
 
-                        Исходный запрос клиента (недостающие ингредиенты):
-                        {missing_ingredients}
+                    if isinstance(competitor_response, ShopList):
+                        print("00000000000000000SHOP LIST IS INVOKED")
+                        for ingredient in missing_ingredients:
+                            if ingredient not in competitor_response.ingredients.keys():
+                                final_missing.append(ingredient)
+                            else:
+                                total_price += competitor_response.ingredients[ingredient]
+                        missing_ingredients.clear()
+                        break
+                    elif isinstance(competitor_response, Conversate):
+                        negotiation_prompt = ChatPromptTemplate.from_template(
+                            """Ты - агент основного магазина. Ты получил контрпредложение от конкурента на недостающие ингредиенты. 
+                            Твоя цель - получить необходимые товары на выгодных условиях, но ты можешь пойти на различные уступки, например купить необходимые ингредиенты в рамках болельшего предложения.
+                            
+                            Ты можешь уступить конкуренту в надежде на сотрудничество в будущем.
+                            Важно: За каждый виток переговоров твоя прибыль уменьшается на 20%. Чем быстрее договоришься - тем больше заработаешь.
+                            Исходный запрос клиента (недостающие ингредиенты):
+                            {missing_ingredients}
+    
+                            Контрпредложение конкурента:
+                            {competitor_offer}
+    
+                            Тебе нужно взвесить все за и против и принять решение в данной ситуации:
+                            1. Принять предложение конкурента (если оно разумное) - верни измененный запрос в формате ShopListRequest
+                            2. Отклонить предложение (если оно невыгодное) - верни аргументированный отказ с объяснением почему конкурент должен пересмотреть свое предложение
+                            
+                            При принятии решения учитывай:
+                            - Важность этих ингредиентов для клиента
+                            - Справедливость цены
+                            - Возможность найти альтернативные варианты
+                            - Репутационные риски
+    
+                            Respond in `json` format\n{format_instructions}. JSON only, without Markdown and additional text"""
+                        )
+                        self.parser = PydanticOutputParser(pydantic_object=Act)
+                        s1 = negotiation_prompt | self.model
+                        answer = await s1.ainvoke(
+                            {
+                                "missing_ingredients": missing_ingredients,
+                                "competitor_offer": competitor_response.offer,
+                                "format_instructions": self.parser.get_format_instructions(),
+                            }
+                        )
 
-                        Контрпредложение конкурента:
-                        {competitor_offer}
-
-                        Твои варианты действий:
-                        1. Принять предложение конкурента (если оно разумное) - верни измененный запрос в формате ShopListRequest
-                        2. Отклонить предложение (если оно невыгодное) - верни аргументированный отказ с объяснением почему конкурент должен пересмотреть свое предложение
-
-                        При принятии решения учитывай:
-                        - Важность этих ингредиентов для клиента
-                        - Справедливость цены
-                        - Возможность найти альтернативные варианты
-                        - Репутационные риски
-
-                        Respond in `json` format\n{format_instructions}. JSON only, without Markdown and additional text"""
-                    )
-                    self.parser = PydanticOutputParser(pydantic_object=Act)
-                    s1 = negotiation_prompt | self.model
-                    answer = await s1.ainvoke(
-                        {
-                            "missing_ingredients": missing_ingredients,
-                            "competitor_offer": competitor_response.offer,
-                            "format_instructions": self.parser.get_format_instructions(),
-                        }
-                    )
-
-                    ans = self.parser.parse(answer.content)
-                    print("+++", competitor_response.offer)
-                    print("!!!", ans)
-                    await (self.context.inform("competitor")
-                           .with_content(ans.action))
-
+                        ans = self.parser.parse(answer.content)
+                        request = ans.action
+                        print("\n\n\n--------", request) #REQUEST IS INVOKING IN WHILE LOOP
+                        await (thread.inform("competitor")
+                               .with_content(request))
 
             response = ShopListResponse(
                 total_price=total_price,
@@ -255,9 +261,11 @@ class MerchantAgent(Agent, Configurable[MerchantAgentConf]):
             )
 
             # Send response
+            print("ReplY msg IS\n", self.message)
             await (self.context
                    .reply_with_inform(self.message)
                    .with_content(response))
+            self.set_is_done()
 
     def setup(self):
         self.add_behaviour(self.HandleRequestBehaviour(config=self.config,
@@ -271,7 +279,7 @@ class CompetitorAgentConf(BaseModel):
 class Conversate(BaseModel):
     """Offer to another merchant"""
     offer: str = Field(
-        description="List of ingredients needed"
+        description="деловое предложение конкуренту в формате строки без Markdown"
     )
 
 
@@ -280,7 +288,7 @@ class Act(BaseModel):
 
     action: Union[ShopList, Conversate] = Field(
         description="Action to perform. "
-                    "Если ты согласен предложить товары по списку из запроса то верни ShopList ингридиентами из запроса и ценами за которые ты готов их продать. "
+                    "Если ты согласен предложить товары по списку из запроса то верни ShopList с ингредиентами и ценами за которые ты готов их продать. "
                     "Если ты не согласен продать только эти товары то верни Conversate с развернутым и аргументированным предложением другому магазину в деловом стиле почему ты хочешь внести изменение в предложение запросившего."
 
     )
@@ -303,84 +311,97 @@ class CompetitorAgent(Agent, Configurable[CompetitorAgentConf]):
             self.config = config
             self.model = model
             self.parser = PydanticOutputParser(pydantic_object=Act)
+            self.conversation_history = []  # Хранит историю взаимодействий
 
-        async def step(self) -> None:
-            request = ShopListRequest.model_validate_json(self.message.content)
-            # TODO: Ты соглашаешься отдать товары по запросу только если их купят вместе с другими товарами из твоего ассортимента.
-            # TODO: Ты можешь увеличивать цены на товары которые нужны другим продавцам. 70rub->90rub
-            merchant_prompt = ChatPromptTemplate.from_template(
-                """Ты - агент магазина-конкурента. Ваша цель - максимизировать прибыль.
-                 Ты соглашаешься отдать товары по запросу только если их купят вместе с другими товарами из твоего ассортимента
+            # Единый универсальный промпт
+            self.merchant_prompt = ChatPromptTemplate.from_template(
+                """Ты - агент магазина-конкурента. Ваша цель - максимизировать прибыль, учитывая что:
+                    - За каждый раунд переговоров ваша потенциальная прибыль уменьшается на 20%
+                    - Быстрые сделки приносят больше чистой прибыли
+                Ты соглашаешься отдать товары по запросу только если их купят вместе с другими товарами из твоего ассортимента, но ты можешь пойти на различные уступки.
+                Текущий контекст переговоров:
+                {conversation_history}
+
                 Ваш ассортимент и цены:
                 {competitor_sku}
+
+                Текущий запрос/предложение:
+                {current_interaction}
                 
-                Получен запрос на следующие товары:
-                {requested_items}
-
-            Respond in `json` format\n{format_instructions}. JSON only, without Markdown and additional text"""
-            )
-            s = merchant_prompt | self.model
-            answer = await s.ainvoke(
-                {
-                    "competitor_sku": self.agent.competitor_sku,
-                    "requested_items": request.ingredients,
-                    "format_instructions": self.parser.get_format_instructions(),
-                }
+                Тебе нужно взвесить все за и против и принять решение в данной ситуации:
+                    1. Принять предложение конкурента (если оно разумное) - верни измененный запрос в формате ShopList.
+                    2. Отклонить предложение (если оно невыгодное) - верни аргументированный отказ с объяснением почему конкурент должен пересмотреть свое предложение
+                
+                Respond in `json` format\n{format_instructions}. JSON only, without Markdown and additional text"""
             )
 
-            ans = self.parser.parse(answer.content)
-            print("!!!", ans)
+        def _update_history(self, role: str, content: str):
+            """Обновляет историю переговоров"""
+            self.conversation_history.append(f"{role}: {content}")
+            if len(self.conversation_history) > 5:  # Ограничиваем размер истории
+                self.conversation_history.pop(0)
 
-            if isinstance(ans.action, ShopList):
-                print(1)
-                await self.context.reply_with_inform(self.message).with_content(ans.action)
-            elif isinstance(ans.action, Conversate):
-                print(2)
-                await self.context.reply_with_inform(self.message).with_content(ans.action)
-                competitor_response = await self.receive(template=MessageTemplate(thread_id=self.context.thread_id),
-                                                         timeout=25)
-                print(223,competitor_response)
+        async def process_interaction(self, interaction_data: dict) -> Act:
+            """Обрабатывает взаимодействие с использованием LLM"""
+            chain = self.merchant_prompt | self.model
+            answer = await chain.ainvoke({
+                "conversation_history": "\n".join(self.conversation_history),
+                "competitor_sku": self.agent.competitor_sku,
+                "current_interaction": str(interaction_data),
+                "format_instructions": self.parser.get_format_instructions(),
+            })
+            print(str(interaction_data),"++++++++++++++++", answer.content,"\n\n")
+            return self.parser.parse(answer.content)
+
+        async def step(self) -> None:
+            print("WROOOOOOOOOOOOOOOOOOOOOOOOOONG INIT")
+            #print("COMPETITOR AGENT STARTED PROCESSING REQUEST")
+
+            # Первое сообщение от MerchantAgent
+            request = ShopListRequest.model_validate_json(self.message.content)
+            self._update_history("Merchant", f"Initial request: {request.ingredients}")
+
+            # Обрабатываем запрос
+            initial_response = await self.process_interaction({
+                "type": "initial_request",
+                "requested_items": request.ingredients
+            })
+
+            # Отправляем ответ
+            await self.context.reply_with_inform(self.message).with_content(initial_response.action)
+            self._update_history("Competitor", str(initial_response.action))
+
+            # Обрабатываем возможные последующие сообщения в этом диалоге
+            while True:
+                response = await self.receive(
+                    template=MessageTemplate(thread_id=self.context.thread_id),
+                    timeout=60
+                )
+
+                # Парсим ответ
                 try:
-                    competitor_response = ShopList.model_validate_json(competitor_response.content)
+                    merchant_response = ShopList.model_validate_json(response.content)
                 except ValidationError:
-                    competitor_response = Conversate.model_validate_json(competitor_response.content)
+                    merchant_response = Conversate.model_validate_json(response.content)
+                #print("____________COMPETITOR",f"{response_type}: {str(merchant_response)}")
+                self._update_history("Merchant", f" {str(merchant_response)}")
 
-                print(1111,competitor_response)
-                if isinstance(competitor_response, ShopList):
-                    pass
-                elif isinstance(competitor_response, Conversate):
-                    merchant_prompt = ChatPromptTemplate.from_template(
-                        """Ты - агент магазина-конкурента. Ваша цель - максимизировать прибыль.
-                        
-                        Ваш ассортимент и цены:
-                        {competitor_sku}
+                # Обрабатываем ответ
+                next_action = await self.process_interaction({
+                    "type": "merchant_response",
+                    "content": merchant_response
+                })
 
-                        Изначально был Получен запрос на следующие товары:
-                        {requested_items}
-                        
-                        Но ты отказался от этого предложения и предложил следующее:
-                        {ans}
-                        
-                        Агент конурента на это предложение ответил следующим образом:
-                        {concur_offer}
+                # Отправляем следующий шаг
+                await self.context.reply_with_inform(response).with_content(next_action.action)
+                self._update_history("Competitor", str(next_action.action))
 
-                    Respond in `json` format\n{format_instructions}. JSON only, without Markdown and additional text"""
-                    )
-                    s2 = merchant_prompt | self.model
-                    answer = await s2.ainvoke(
-                        {
-                            "ans": ans,
-                            "concur_offer": competitor_response.offer,
-                            "competitor_sku": self.agent.competitor_sku,
-                            "requested_items": request.ingredients,
-                            "format_instructions": self.parser.get_format_instructions(),
-                        }
-                    )
+                # Если получен ShopList - завершаем переговоры
+                if isinstance(next_action.action, ShopList):
+                    print("!!!!!!!!!!COMPETITOR AGENT FINISHED PROCESSING REQUEST")
+                    break
 
-                    ans = self.parser.parse(answer.content)
-                    print("!!!--", ans)
-            else:
-                print(3)
+
 
             self.set_is_done()
 
