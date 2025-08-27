@@ -132,7 +132,6 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
         def __init__(self, config: ProposalBoardAgentConf):
             super().__init__(MessageTemplate.acknowledge())
             self.config = config
-            print('INITED REQUEST')
 
         async def step(self):
             print('-----------------', self.message.sender)
@@ -145,9 +144,9 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
 
 
 # --- //// --- Merchants --- //// --- --- /// ---
-
 class FirstMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
+    bid_delay: float = Field(default=0, description="Delay between bids")
 
 
 @configuration(FirstMerchantAgentConf)
@@ -172,36 +171,11 @@ class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
         # }
     }
 
-    class HandleRequestProposalBehaviour(MessageHandlingBehavior):
-
-        def __init__(self, config: FirstMerchantAgentConf, model: BaseChatModel):
-            super().__init__(MessageTemplate.request_proposal())
-            self.config = config
-            self.model = model
-
-        async def get_current_board(self) -> ProposalBoard:
-            await self.context.acknowledge('proposal_board').with_content('')
-            response = await self.receive(
-                template=MessageTemplate(thread_id=self.context.thread_id, performative=consts.INFORM),
-                timeout=60,
-            )
-            return ProposalBoard.model_validate_json(response.content)
-
-        async def step(self) -> None:
-            print(123)
-            # Parse incoming request
-            request = ShopListRequest.model_validate_json(self.message.content)
-            # print(71313131313, request)
-            my_offer = ShopList(ingredients={key: self.agent.shop_sku[key] for key in request.ingredients if
-                                             key in self.agent.shop_sku.keys()})
-            await asyncio.sleep(0.11)
-            await self.context.reply_with_propose(self.message).with_content(my_offer)
-
     def setup(self):
         asyncio.create_task(self.register_in_df())
-        self.add_behaviour(self.HandleRequestProposalBehaviour(config=self.config,
-                                                               model=self.default_context.create_chat_model(
-                                                                   self.config.model)))
+        self.add_behaviour(AuctionBidderBehaviour(config=self.config,
+                                                  model=self.default_context.create_chat_model(
+                                                      self.config.model)))
 
     async def register_in_df(self):
         context = self.default_context
@@ -226,6 +200,7 @@ class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
 
 class SecondMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
+    bid_delay: float = Field(default=0.1, description="Delay between bids")
 
 
 @configuration(SecondMerchantAgentConf)
@@ -250,35 +225,11 @@ class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
         # }
     }
 
-    class HandleRequestProposalBehaviour(MessageHandlingBehavior):
-
-        def __init__(self, config: FirstMerchantAgentConf, model: BaseChatModel):
-            super().__init__(MessageTemplate.request_proposal())
-            self.config = config
-            self.model = model
-
-        async def get_current_board(self) -> ProposalBoard:  # надо использовать !!
-            print(123)
-            await self.context.acknowledge('proposal_board').with_content('')
-            response = await self.receive(
-                template=MessageTemplate(thread_id=self.context.thread_id, performative=consts.INFORM),
-                timeout=60,
-            )
-            return ProposalBoard.model_validate_json(response.content)
-
-        async def step(self) -> None:
-            # Parse incoming request
-            request = ShopListRequest.model_validate_json(self.message.content)
-            # print(71313131313, request)
-            my_offer = ShopList(ingredients={key: self.agent.shop_sku[key] for key in request.ingredients if
-                                             key in self.agent.shop_sku.keys()})
-            await self.context.reply_with_propose(self.message).with_content(my_offer)
-
     def setup(self):
         asyncio.create_task(self.register_in_df())
-        self.add_behaviour(self.HandleRequestProposalBehaviour(config=self.config,
-                                                               model=self.default_context.create_chat_model(
-                                                                   self.config.model)))
+        self.add_behaviour(AuctionBidderBehaviour(config=self.config,
+                                                  model=self.default_context.create_chat_model(
+                                                      self.config.model)))
 
     async def register_in_df(self):
         context = self.default_context
@@ -396,26 +347,26 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
             if winner is None:
                 # Check if proposal is missing any ingredients from the current best
                 if set(self.agent.proposal_board.proposal.ingredients.keys()) - set(proposal.prop.ingredients.keys()):
-                    logger.info('Missing some ingredients from the current best')
+                    logger.info('Missing some ingredients from the current best. Refusing')
                     await self.context.refuse(proposal.author).with_content('')
                 # Check if proposal has all ingredients plus extra from request
                 elif set(proposal.prop.ingredients.keys()) - set(self.agent.proposal_board.proposal.ingredients.keys()):
-                    logger.info('Has all ingredients plus extra from request')
+                    logger.info('Has all ingredients plus extra from request. Accepting')
                     winner = proposal
                     self.agent.proposal_board.proposal = winner.prop
                     await self.context.accept(proposal.author).with_content('')
                 # Compare prices if both proposals have the same ingredients
                 elif sum(proposal.prop.ingredients.values()) < sum(
                         self.agent.proposal_board.proposal.ingredients.values()):
-                    logger.info('Lower price for same ingredients')
+                    logger.info('Lower price for same ingredients. Accepting')
                     winner = proposal
                     self.agent.proposal_board.proposal = winner.prop
                     await self.context.accept(proposal.author).with_content('')
                 else:
-                    logger.info('Higher or equal price, rejecting')
+                    logger.info('Higher or equal price, rejecting. Refusing')
                     await self.context.refuse(proposal.author).with_content('')
             else:
-                logger.info('Already updated board, rejecting')
+                logger.info('Already updated board. Refusing')
                 # ТУТ ЕСЛИ ВОЗВРАЩАЕМ UPDATING то агенту надо заретраить посылку
                 await self.context.refuse(proposal.author).with_content('UPDATING')
         # Update the proposal board with the winner
@@ -424,3 +375,40 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
             return self.agent.proposal_board.proposal
         else:
             return winner.prop
+
+
+class AuctionBidderBehaviour(MessageHandlingBehavior):
+    def __init__(self, config, model: BaseChatModel):
+        super().__init__(MessageTemplate.request_proposal())
+        self.config = config
+        self.model = model
+
+    async def get_current_board(self) -> ProposalBoard:
+        await asleep(self.config.bid_delay)
+        await self.context.acknowledge('proposal_board').with_content('')
+        response = await self.receive(
+            template=MessageTemplate(thread_id=self.context.thread_id, performative=consts.INFORM),
+            timeout=60,
+        )
+        return ProposalBoard.model_validate_json(response.content)
+
+    async def get_my_bid(self, sender: AgentId):
+        current_board = await self.get_current_board()
+        my_bid = ShopList(ingredients={key: self.agent.shop_sku[key] for key in current_board.sku_request.ingredients if
+                                       key in self.agent.shop_sku.keys()})
+        return my_bid.model_dump_json()
+
+    async def step(self) -> None:
+        # Parse incoming request
+        # вот тут надо вызвать функцию получения оффера
+        my_bid = await self.get_my_bid(self.message.sender)
+        await asyncio.sleep(self.config.bid_delay)
+        await self.context.reply_with_propose(self.message).with_content(my_bid)
+        response = await self.receive(MessageTemplate(thread_id=self.context.thread_id), timeout=15)
+        if response.content == 'UPDATING':
+            # тут надо ничего не делать, оставить
+            print('UPDATING')
+            pass
+        else:
+            # тут надо свитч на аксепт или рефуз
+            pass
