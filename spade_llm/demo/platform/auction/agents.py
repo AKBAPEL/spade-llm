@@ -109,22 +109,15 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 ingredients=self.ingredients)  # Тут в будущем будет составляться список. Пока хардкодим
             print(777, self.agent.proposal_board.sku_request.model_dump_json())
             await asyncio.sleep(1)
-            request = AuctionContractNetInitiatorBehavior(
-                task=self.agent.proposal_board.sku_request,
-                context=self.context,
-                time_to_wait_for_proposals=10
-            )
+            for i in range(3):
+                request = AuctionContractNetInitiatorBehavior(
+                    task=self.agent.proposal_board.sku_request,
+                    context=self.context,
+                    time_to_wait_for_proposals=10
+                )
 
-            self.agent.add_behaviour(request)
-            await request.join()
-            request = AuctionContractNetInitiatorBehavior(
-                task=self.agent.proposal_board.sku_request,
-                context=self.context,
-                time_to_wait_for_proposals=10
-            )
-
-            self.agent.add_behaviour(request)
-            await request.join()
+                self.agent.add_behaviour(request)
+                await request.join()
             await self.context.reply_with_inform(self.message).with_content('Все ок')
             self.set_is_done()
 
@@ -134,7 +127,8 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             self.config = config
 
         async def step(self):
-            print('-----------------', self.message.sender)
+            logger.info("Sent board status to %s", self.message.sender.agent_type)
+            await asyncio.sleep(1)
             await self.context.reply_with_inform(self.message).with_content(self.agent.proposal_board)
 
     def setup(self):
@@ -153,6 +147,7 @@ class FirstMerchantAgentConf(BaseModel):
 class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.current_bid = None
 
     shop_sku = {
         "мясо (говядина)": 320,
@@ -200,13 +195,14 @@ class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
 
 class SecondMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
-    bid_delay: float = Field(default=0.1, description="Delay between bids")
+    bid_delay: float = Field(default=1.5, description="Delay between bids")
 
 
 @configuration(SecondMerchantAgentConf)
 class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.current_bid = None
 
     shop_sku = {
         "мясо (говядина)": 320,
@@ -345,16 +341,24 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
         winner = None
         for proposal in proposals:
             if winner is None:
+                current_supply = set(self.agent.proposal_board.proposal.ingredients.keys()).intersection(
+                    set(self.agent.proposal_board.sku_request.ingredients))
+                logger.info("В предложении агента нет необходимых ингредиентов: %s",
+                            str(set(current_supply) - set(proposal.prop.ingredients.keys())))
+
                 # Check if proposal is missing any ingredients from the current best
-                if set(self.agent.proposal_board.proposal.ingredients.keys()) - set(proposal.prop.ingredients.keys()):
+                if set(current_supply) - set(proposal.prop.ingredients.keys()):
+                    # ТУТ НА САМОМ ДЕЛЕ ОТКАЗ ТОЛЬКО ЕСЛИ НЕТ КАКОГО ТО ИЗ ЗАПРАШИВАЕМЫХ КОТОРЫЕ ЕСТЬ В ПРЕДЛОЖЕНИИ  А НЕ ИЗ СТАВКИ
                     logger.info('Missing some ingredients from the current best. Refusing')
                     await self.context.refuse(proposal.author).with_content('')
+
                 # Check if proposal has all ingredients plus extra from request
                 elif set(proposal.prop.ingredients.keys()) - set(self.agent.proposal_board.proposal.ingredients.keys()):
                     logger.info('Has all ingredients plus extra from request. Accepting')
                     winner = proposal
                     self.agent.proposal_board.proposal = winner.prop
                     await self.context.accept(proposal.author).with_content('')
+
                 # Compare prices if both proposals have the same ingredients
                 elif sum(proposal.prop.ingredients.values()) < sum(
                         self.agent.proposal_board.proposal.ingredients.values()):
@@ -362,6 +366,7 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
                     winner = proposal
                     self.agent.proposal_board.proposal = winner.prop
                     await self.context.accept(proposal.author).with_content('')
+
                 else:
                     logger.info('Higher or equal price, rejecting. Refusing')
                     await self.context.refuse(proposal.author).with_content('')
@@ -377,11 +382,57 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
             return winner.prop
 
 
+class Conversate(BaseModel):
+    """Offer to another merchant"""
+    offer: str = Field(
+        description="деловое предложение конкуренту в формате строки без Markdown"
+    )
+
+
+class Act(BaseModel):
+    """Action to perform."""
+
+    action: Union[ShopList, Conversate] = Field(
+        description="Action to perform. "
+                    "Если ты согласен предложить товары по списку из запроса то верни ShopList с ингредиентами и ценами за которые ты готов их продать. "
+                    "Если ты не согласен продать только эти товары то верни Conversate с развернутым и аргументированным предложением другому магазину в деловом стиле почему ты хочешь внести изменение в предложение запросившего."
+
+    )
+
+
+class Decision(BaseModel):
+    decision: Union[ShopList, str] = Field(description="Decision to perform."
+                                                       "Если ты согласен предложить товары по списку из запроса то верни ShopList с ингредиентами и ценами за которые ты готов их продать. "
+                                                       "Если ты хочешь начать переговоры с другим агентом для совместной ставки то верни строку StartDialogue")
+
+
 class AuctionBidderBehaviour(MessageHandlingBehavior):
     def __init__(self, config, model: BaseChatModel):
         super().__init__(MessageTemplate.request_proposal())
         self.config = config
         self.model = model
+
+        self.decision_parser = PydanticOutputParser(pydantic_object=Decision)
+        self.shoplist_parser = PydanticOutputParser(pydantic_object=ShopList)
+        self.merchant_prompt = ChatPromptTemplate.from_template(
+            """Ты - агент магазина. Ваша цель - максимизировать прибыль. Если ты не участвуешь в победной ставке то ты не получаешь прибыль. 
+            Если по результатом аукциона в текущей лучшей ставке нет всех ингредиентов из запроса, то никто не получает прибыль.
+            Но тебе никто не запрещает делать неполную ставку. Если ее примут, то другие агенты могут начать с тобой сотрудничать.
+
+            Ваш ассортимент и цены:
+            {my_sku}
+            
+            Текущее лидирующее предложение:
+            {current_board}
+            
+            Список доступных к перегвоорам агентов-магазинов, которые участвуют в аукционе (если их нет то ты не можешь начать переговоры): 
+            {agents_able_to_conversate}
+            
+            Тебе нужно взвесить все за и против и принять решение в данной ситуации:
+                1. Отправлять предложение самому. Тогда тебе нужно понять - какие ингредиенты и по какой цене ты хочешь предложить на этой итерации аукциона в формате ShopList.
+                2. Начать переговоры с другим агентом-магазином, чтобы сделать совместную ставку на аукционе. Тогда верни строку StartDialogue.
+            Respond in `json` format\n{format_instructions}. JSON only, without Markdown and additional text"""
+        )
 
     async def get_current_board(self) -> ProposalBoard:
         await asleep(self.config.bid_delay)
@@ -392,23 +443,57 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         )
         return ProposalBoard.model_validate_json(response.content)
 
-    async def get_my_bid(self, sender: AgentId):
+    async def update_my_bid(self):
         current_board = await self.get_current_board()
-        my_bid = ShopList(ingredients={key: self.agent.shop_sku[key] for key in current_board.sku_request.ingredients if
-                                       key in self.agent.shop_sku.keys()})
-        return my_bid.model_dump_json()
+
+        chain = self.merchant_prompt | self.model
+        answer = await chain.ainvoke({
+            "my_sku": self.agent.shop_sku,
+            "current_board": current_board,
+            "format_instructions": self.decision_parser.get_format_instructions(),
+            "agents_able_to_conversate": []
+        })
+        response = self.decision_parser.parse(answer.content).decision
+        print(8888888888888888888888888, response)
+        # Просто заглушка отдаем все  ингредиенты
+        # self.agent.current_bid = ShopList(ingredients={key: self.agent.shop_sku[key] for key in current_board.sku_request.ingredients if
+        #                                key in self.agent.shop_sku.keys()})
+        #self.agent.current_bid = self.shoplist_parser.parse(response)
+        if isinstance(response, ShopList):
+            self.agent.current_bid = response
+            print("+++", self.agent.current_bid)
+
+        else:
+            start_conversation = StartDialogueBehaviour()
+            # Тут надо еще много допилить
+            self.agent.add_behaviour(start_conversation)
+            await start_conversation.join()
+        return
+    async def get_my_bid(self):
+        if self.agent.current_bid is None:
+            await self.update_my_bid()
+        # надо добавить логику того что агент может отказаться от ставки
+        return self.agent.current_bid.model_dump_json()
 
     async def step(self) -> None:
-        # Parse incoming request
-        # вот тут надо вызвать функцию получения оффера
-        my_bid = await self.get_my_bid(self.message.sender)
-        await asyncio.sleep(self.config.bid_delay)
+        my_bid = await self.get_my_bid()
+
+        await asyncio.sleep(self.config.bid_delay)  # небольшой await чтобы не было коллизий по отправке в один момент
         await self.context.reply_with_propose(self.message).with_content(my_bid)
+
         response = await self.receive(MessageTemplate(thread_id=self.context.thread_id), timeout=15)
+
         if response.content == 'UPDATING':
-            # тут надо ничего не делать, оставить
+            # тут надо ничего не делать, оставить текущую ставку
             print('UPDATING')
-            pass
         else:
             # тут надо свитч на аксепт или рефуз
-            pass
+            if response.performative == consts.ACCEPT:
+                # тут надо обозначить что моя текущая ставка - лидирующая
+                pass
+            elif response.performative == consts.REFUSE:
+                # если отказали то надо обновить предложение
+                await self.update_my_bid()
+            else:
+                # ??
+                pass
