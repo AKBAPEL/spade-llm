@@ -1,5 +1,4 @@
 import errno
-import logging
 import time
 from spade_llm.demo.platform.contractnet.contractnet import *
 import os
@@ -37,8 +36,9 @@ from spade_llm.demo.platform.contractnet.contractnet import ContractNetResponder
     ContractNetResponderBehavior, ContractNetInitiatorBehavior
 from spade_llm.demo.platform.contractnet.discovery import AgentDescription, AgentTask, DF_ADDRESS
 
-logger = logging.getLogger(__name__)
+import logging
 
+logger = logging.getLogger(__name__)
 
 class ShopList(BaseModel):
     """List of ingredients with price"""
@@ -47,14 +47,12 @@ class ShopList(BaseModel):
         default_factory=dict,
     )
 
-
 class ShopListRequest(BaseModel):
     """Request for shop list with ingredients"""
     ingredients: List[str] = Field(
         description="List of ingredients needed",
         default_factory=list
     )
-
 
 class ShopListResponse(BaseModel):
     """Response with total price for ingredients"""
@@ -67,16 +65,16 @@ class ShopListResponse(BaseModel):
         default_factory=list
     )
 
-
 class ProposalBoard(BaseModel):
     agent: str = Field(description="Name of the agent who proposed")
     proposal: ShopList = Field(description="Current best proposal in ShopList format")
     sku_request: ShopListRequest = Field(description="User sku`s request")
-
+    round_number: int = Field(default=0, description="Текущий номер раунда аукциона")
+    total_rounds: int = Field(default=0, description="Всего раундов аукциона")
 
 class ProposalBoardAgentConf(BaseModel):
-    pass
-
+    total_rounds: int = Field(default=10, description="Общее количество раундов аукциона")
+    stable_limit: int = Field(default=3, description="Сколько раундов подряд должна держаться ставка для завершения")
 
 @configuration(ProposalBoardAgentConf)
 class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
@@ -84,19 +82,10 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
 
     class InitialRequestBehaviour(MessageHandlingBehavior):
         ingredients = [
-            'мясо (говядина)',
-            'свёкла',
-            'морковь',
-            'лук репчатый',
-            'капуста белокочанная',
-            'картофель',
-            'томатная паста',
-            'чеснок',
-            'уксус (лимонный сок)',
-            'лавровый лист',
-            'соль, перец',
-            'зелень (укроп/петрушка)',
-            'сметана'
+            "мясо (говядина)", "свёкла", "морковь", "лук репчатый",
+            "капуста белокочанная", "картофель", "томатная паста", "чеснок",
+            "уксус (лимонный сок)", "лавровый лист", "соль, перец",
+            "зелень (укроп/петрушка)", "сметана"
         ]
 
         def __init__(self, config: ProposalBoardAgentConf):
@@ -104,21 +93,63 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             self.config = config
 
         async def step(self) -> None:
-            # Create request model
-            self.agent.proposal_board.sku_request = ShopListRequest(
-                ingredients=self.ingredients)  # Тут в будущем будет составляться список. Пока хардкодим
-            print(777, self.agent.proposal_board.sku_request.model_dump_json())
+            self.agent.proposal_board.sku_request = ShopListRequest(ingredients=self.ingredients)
             await asyncio.sleep(1)
-            for i in range(3):
+
+            stable_rounds = 0
+            last_winner = None
+
+            for i in range(self.config.total_rounds):
+                round_number = i + 1
+                logger.info("Starting auction round %d/%d", round_number, self.config.total_rounds)
+
                 request = AuctionContractNetInitiatorBehavior(
                     task=self.agent.proposal_board.sku_request,
                     context=self.context,
                     time_to_wait_for_proposals=10
                 )
 
+                self.agent.proposal_board.round_number = round_number
+                self.agent.proposal_board.total_rounds = self.config.total_rounds
+
                 self.agent.add_behaviour(request)
                 await request.join()
-            await self.context.reply_with_inform(self.message).with_content('Все ок')
+
+                current_winner = dict(self.agent.proposal_board.proposal.ingredients)
+
+                if last_winner == current_winner:
+                    stable_rounds += 1
+                    logger.info("Winning bid unchanged for %d rounds", stable_rounds)
+                else:
+                    stable_rounds = 0
+                last_winner = current_winner
+
+                logger.info("Completed auction round %d", round_number)
+                logger.info("Current auction state: proposal_board=%s", self.agent.proposal_board)
+
+                requested_ingredients = set(self.agent.proposal_board.sku_request.ingredients)
+                proposed_ingredients = set(self.agent.proposal_board.proposal.ingredients.keys())
+                all_collected = requested_ingredients.issubset(proposed_ingredients)
+
+                if stable_rounds >= self.config.stable_limit and all_collected:
+                    logger.info("Auction finished early at round %d: stable %d rounds and order complete",
+                                round_number, self.config.stable_limit)
+                    break
+
+            requested_ingredients = set(self.agent.proposal_board.sku_request.ingredients)
+            proposed_ingredients = set(self.agent.proposal_board.proposal.ingredients.keys())
+            missing_ingredients = requested_ingredients - proposed_ingredients
+
+            if not missing_ingredients:
+                total_price = sum(self.agent.proposal_board.proposal.ingredients.values())
+                await self.context.reply_with_inform(self.message).with_content(
+                    f"Все ингредиенты найдены. Общая цена: {total_price}"
+                )
+            else:
+                await self.context.reply_with_inform(self.message).with_content(
+                    f"Не удалось собрать все ингредиенты. Отсутствуют: {', '.join(missing_ingredients)}"
+                )
+
             self.set_is_done()
 
     class RequestInfoBehaviour(MessageHandlingBehavior):
@@ -127,50 +158,47 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             self.config = config
 
         async def step(self):
-            logger.info("Sent board status to %s", self.message.sender.agent_type)
             await asyncio.sleep(1)
             await self.context.reply_with_inform(self.message).with_content(self.agent.proposal_board)
 
     def setup(self):
         self.add_behaviour(self.InitialRequestBehaviour(self.config))
         self.add_behaviour(self.RequestInfoBehaviour(self.config))
-        # self.add_behaviour(self.HandleProposalBehaviour(self.config))
 
-
-# --- //// --- Merchants --- //// --- --- /// ---
 class FirstMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
     bid_delay: float = Field(default=0, description="Delay between bids")
 
-
 @configuration(FirstMerchantAgentConf)
 class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
+    shop_sku = {
+        "мясо (говядина)": 350,  # Higher price to encourage competition
+        "свёкла": 50,            # Exclusive to FirstMerchant
+        "морковь": 35,
+        "лук репчатый": 25,
+        "капуста белокочанная": 85,
+        "картофель": 45,
+        "томатная паста": 40,
+        "чеснок": 20,
+        "уксус (лимонный сок)": 10,  # Exclusive to FirstMerchant
+        "лавровый лист": 5,
+        "соль, перец": 10,
+        "зелень (укроп/петрушка)": 30
+    }
+
+    # Rest of the FirstMerchantAgent implementation remains unchanged
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.current_bid = None
-
-    shop_sku = {
-        "мясо (говядина)": 320,
-        "свёкла": 50,
-        "морковь": 30,
-        "лук репчатый": 20,
-        "капуста белокочанная": 80,
-        "картофель": 40,
-        "томатная паста": 35,
-        "чеснок": 15,
-        "уксус (лимонный сок)": 10,
-        "лавровый лист": 5,
-        "соль, перец": 10,
-        "зелень (укроп/петрушка)": 25,
-        #     "сметана": 60
-        # }
-    }
 
     def setup(self):
         asyncio.create_task(self.register_in_df())
         self.add_behaviour(AuctionBidderBehaviour(config=self.config,
                                                   model=self.default_context.create_chat_model(
                                                       self.config.model)))
+        self.add_behaviour(DialogueResponderBehaviour(config=self.config,
+                                                      model=self.default_context.create_chat_model(
+                                                          self.config.model)))
 
     async def register_in_df(self):
         context = self.default_context
@@ -192,40 +220,39 @@ class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
             ]
         )
 
-
 class SecondMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
     bid_delay: float = Field(default=1.5, description="Delay between bids")
 
-
 @configuration(SecondMerchantAgentConf)
 class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.current_bid = None
-
     shop_sku = {
-        "мясо (говядина)": 320,
-        # "свёкла": 50,
-        "морковь": 30,
-        "лук репчатый": 20,
+        "мясо (говядина)": 320,  # Lower price to undercut FirstMerchant
+        "морковь": 30,           # Cheaper than FirstMerchant
+        "лук репчатый": 20,      # Cheaper than FirstMerchant
         "капуста белокочанная": 80,
         "картофель": 40,
         "томатная паста": 35,
         "чеснок": 15,
-        "уксус (лимонный сок)": 10,
         "лавровый лист": 5,
         "соль, перец": 10,
         "зелень (укроп/петрушка)": 25,
-        "сметана": 60
-        # }
+        "сметана": 60            # Exclusive to SecondMerchant
     }
+
+    # Rest of the SecondMerchantAgent implementation remains unchanged
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.current_bid = None
 
     def setup(self):
         asyncio.create_task(self.register_in_df())
         self.add_behaviour(AuctionBidderBehaviour(config=self.config,
                                                   model=self.default_context.create_chat_model(
                                                       self.config.model)))
+        self.add_behaviour(DialogueResponderBehaviour(config=self.config,
+                                                      model=self.default_context.create_chat_model(
+                                                          self.config.model)))
 
     async def register_in_df(self):
         context = self.default_context
@@ -247,12 +274,9 @@ class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
             ]
         )
 
-
-# ---- AUCTION CONTRACT NET ----
 class AuctionProposal(BaseModel):
     author: AgentId = Field(description="Name of the agent who proposed", default='')
     prop: ShopList = Field(description="proposal_shoplist")
-
 
 class AuctionContractNetInitiatorBehavior(ContextBehaviour):
     task: ShopListRequest
@@ -282,18 +306,11 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
 
     async def step(self) -> None:
         agents: List[AgentDescription] = await self.find_agents(self.task)
-        logger.info("Found %i agents for task", len(agents))
 
         if len(agents) > 0:
             proposals: List[ShopList] = await self.get_proposals(agents)
-            logger.info("Got %i proposals for task", len(proposals))
             if len(proposals) > 0:
                 self.proposal = await self.extract_winner_and_notify_losers(proposals)
-                logger.info("Best proposal is %s", self.proposal)
-            else:
-                logger.error("Failed to get any proposals in time")
-        else:
-            logger.error("Failed to find any agents")
         self.set_is_done()
 
     async def find_agents(self, task: ShopListRequest) -> List[AgentDescription]:
@@ -308,7 +325,6 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
             parsed = AgentSearchResponse.model_validate_json(search.content)
             return parsed.agents
         else:
-            logger.error(f"No search received in {10} seconds")
             return []
 
     async def get_proposals(self, agents: List[AgentDescription]) -> List[AuctionProposal]:
@@ -316,7 +332,6 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
         received: Set[str] = set()
         result: List[AuctionProposal] = []
 
-        # request = ContractNetRequest(task=self.task.model_dump_json())
         for agent in agents:
             sent.add(agent.id)
             await (self.context.request_proposal(agent.id).with_content(self.task.model_dump_json()))
@@ -329,7 +344,6 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
                 max(0.1, deadline - time.time()))
             if response:
                 received.add(str(response.sender))
-                # Tyt если в один момент два пропозала то может не считать
                 prop = AuctionProposal(author=response.sender, prop=ShopList.model_validate_json(response.content))
                 result.append(prop)
         return result
@@ -343,44 +357,29 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
             if winner is None:
                 current_supply = set(self.agent.proposal_board.proposal.ingredients.keys()).intersection(
                     set(self.agent.proposal_board.sku_request.ingredients))
-                logger.info("В предложении агента нет необходимых ингредиентов: %s",
-                            str(set(current_supply) - set(proposal.prop.ingredients.keys())))
 
-                # Check if proposal is missing any ingredients from the current best
                 if set(current_supply) - set(proposal.prop.ingredients.keys()):
-                    # ТУТ НА САМОМ ДЕЛЕ ОТКАЗ ТОЛЬКО ЕСЛИ НЕТ КАКОГО ТО ИЗ ЗАПРАШИВАЕМЫХ КОТОРЫЕ ЕСТЬ В ПРЕДЛОЖЕНИИ  А НЕ ИЗ СТАВКИ
-                    logger.info('Missing some ingredients from the current best. Refusing')
                     await self.context.refuse(proposal.author).with_content('')
 
-                # Check if proposal has all ingredients plus extra from request
                 elif set(proposal.prop.ingredients.keys()) - set(self.agent.proposal_board.proposal.ingredients.keys()):
-                    logger.info('Has all ingredients plus extra from request. Accepting')
                     winner = proposal
                     self.agent.proposal_board.proposal = winner.prop
                     await self.context.accept(proposal.author).with_content('')
 
-                # Compare prices if both proposals have the same ingredients
                 elif sum(proposal.prop.ingredients.values()) < sum(
                         self.agent.proposal_board.proposal.ingredients.values()):
-                    logger.info('Lower price for same ingredients. Accepting')
                     winner = proposal
                     self.agent.proposal_board.proposal = winner.prop
                     await self.context.accept(proposal.author).with_content('')
 
                 else:
-                    logger.info('Higher or equal price, rejecting. Refusing')
                     await self.context.refuse(proposal.author).with_content('')
             else:
-                logger.info('Already updated board. Refusing')
-                # ТУТ ЕСЛИ ВОЗВРАЩАЕМ UPDATING то агенту надо заретраить посылку
                 await self.context.refuse(proposal.author).with_content('UPDATING')
-        # Update the proposal board with the winner
-        # self.agent.proposal_board.proposal = winner
         if winner is None:
             return self.agent.proposal_board.proposal
         else:
             return winner.prop
-
 
 class Conversate(BaseModel):
     """Offer to another merchant"""
@@ -388,23 +387,218 @@ class Conversate(BaseModel):
         description="деловое предложение конкуренту в формате строки без Markdown"
     )
 
-
 class Act(BaseModel):
     """Action to perform."""
 
     action: Union[ShopList, Conversate] = Field(
-        description="Action to perform. "
+        description="Action to perform. Должно быть БЕЗ Markdown!!!"
                     "Если ты согласен предложить товары по списку из запроса то верни ShopList с ингредиентами и ценами за которые ты готов их продать. "
                     "Если ты не согласен продать только эти товары то верни Conversate с развернутым и аргументированным предложением другому магазину в деловом стиле почему ты хочешь внести изменение в предложение запросившего."
-
     )
 
-
 class Decision(BaseModel):
-    decision: Union[ShopList, str] = Field(description="Decision to perform."
-                                                       "Если ты согласен предложить товары по списку из запроса то верни ShopList с ингредиентами и ценами за которые ты готов их продать. "
-                                                       "Если ты хочешь начать переговоры с другим агентом для совместной ставки то верни строку StartDialogue")
+    decision: Union[ShopList, ShopListRequest] = Field(description="Decision to perform. Должно быть БЕЗ Markdown!!!"
+                                                                   "Если ты согласен предложить товары по списку из запроса то верни ShopList с ингредиентами и ценами за которые ты готов их продать. "
+                                                                   "Если ты хочешь начать переговоры с другим агентом для совместной ставки то верни ShopListRequest с теми товарами которые тебе нужны.")
 
+class StartDialogueBehaviour(ContextBehaviour):
+    def __init__(self, context: AgentContext, config, contragent: str, needed_ingredients: ShopListRequest,
+                 model: BaseChatModel):
+        super().__init__(context)
+        self.config = config
+        self.contragent = contragent
+        self.needed_ingredients = needed_ingredients
+        self.model = model
+        self.conversation_history = []
+
+        self.parser = PydanticOutputParser(pydantic_object=Act)
+        self.merchant_prompt = ChatPromptTemplate.from_template(
+            """Ты - опытный агент магазина, мастер переговоров, стремящийся максимизировать прибыль с изяществом и стратегическим чутьем. Твоя цель - заключить сделку, которая принесет максимальную выгоду, но при этом ты должен оставаться убедительным, профессиональным и гибким. Учти:
+
+            - Каждый раунд переговоров снижает потенциальную прибыль на 20%, поэтому быстрые и эффективные сделки предпочтительны.
+            - Ты хочешь продавать товары из своего ассортимента, но готов пойти на разумные уступки ради выгодного сотрудничества.
+            - Аукцион принимает ставку, только если она покрывает ВСЕ ингредиенты текущей лучшей ставки и добавляет новые недостающие из запроса клиента ИЛИ предлагает то же покрытие по более низкой цене. Предложение только недостающих ингредиентов без полного покрытия будет отклонено.
+            - Если ты уже участвуешь в выигрышной ставке (твои уникальные ингредиенты или их комбинация присутствуют в текущей доске), избегай новых переговоров или ставок, чтобы не ухудшить свою позицию и не потерять прибыль.
+
+            Используй креативные стратегии:
+            - Предлагай комбинации товаров, которые увеличивают ценность сделки (например, добавляй популярные товары из своего ассортимента).
+            - Если отказываешься, делай это дипломатично, предлагая альтернативу, которая выгодна обеим сторонам.
+            - Убеди конкурента, подчеркивая взаимную выгоду, используя логические доводы и, при необходимости, легкий шарм.
+            - Если видишь возможность для сотрудничества, предложи совместную ставку, которая усилит позиции обоих агентов.
+
+            Текущий контекст переговоров:
+            {conversation_history}
+
+            Ваш ассортимент и цены:
+            {shop_sku}
+
+            Текущий запрос/предложение тип: {current_interaction_type}
+            Данные: {current_interaction_data}
+
+            Решение:
+            1. Если предложение конкурента выгодно и усиливает твою позицию, прими его, вернув ShopList с согласованными товарами и ценами.
+            2. Если предложение невыгодно, верни Conversate с ярким, убедительным и профессиональным объяснением, почему ты отклоняешь предложение, и предложи альтернативу (например, добавление твоих товаров или снижение цен для совместной ставки).
+
+            Respond in `json` format\n{format_instructions}. JSON only, without Markdown and additional text. БЕЗ Markdown!!!
+            """
+        )
+
+    def _update_history(self, role: str, content: str):
+        self.conversation_history.append(f"{role}: {content}")
+        if len(self.conversation_history) > 5:
+            self.conversation_history.pop(0)
+
+    async def process_response(self, interaction_data: dict) -> Act:
+        chain = self.merchant_prompt | self.model
+        answer = await chain.ainvoke({
+            "conversation_history": "\n".join(self.conversation_history),
+            "shop_sku": self.agent.shop_sku,
+            "current_interaction_type": interaction_data["type"],
+            "current_interaction_data": str(interaction_data["data"]),
+            "format_instructions": self.parser.get_format_instructions(),
+        })
+        print(interaction_data["type"], ":", str(interaction_data["data"]), "++++++++++++++++", answer.content, "\n\n")
+        return self.parser.parse(answer.content)
+
+    async def step(self):
+        thread = await self.context.fork_thread()
+        max_iterations = 5
+        iteration = 0
+
+        current_offer = self.needed_ingredients
+
+        while iteration < max_iterations:
+            if isinstance(current_offer, ShopListRequest):
+                await (thread.request(self.contragent).with_content(current_offer.model_dump_json()))
+            elif isinstance(current_offer, Conversate):
+                await (thread.request(self.contragent).with_content(current_offer.model_dump_json()))
+
+            response = await self.receive(
+                template=MessageTemplate(thread_id=thread.thread_id, performative=consts.ACKNOWLEDGE), timeout=60)
+
+            if not response:
+                break
+
+            try:
+                competitor_response = ShopList.model_validate_json(response.content)
+                combined_ingredients = dict(self.agent.shop_sku)
+                overlaps = set(combined_ingredients.keys()) & set(competitor_response.ingredients.keys())
+                if overlaps:
+                    for overlap in overlaps:
+                        combined_ingredients[overlap] = min(combined_ingredients[overlap],
+                                                            competitor_response.ingredients[overlap])
+                combined_ingredients.update(
+                    {k: v for k, v in competitor_response.ingredients.items() if k not in self.agent.shop_sku})
+                combined_bid = ShopList(ingredients=combined_ingredients)
+                self.agent.current_bid = combined_bid
+                break
+            except ValidationError:
+                try:
+                    competitor_response = Conversate.model_validate_json(response.content)
+                    self._update_history("Opponent", str(competitor_response))
+                    act = await self.process_response(
+                        {"type": type(competitor_response).__name__, "data": competitor_response.model_dump()})
+                    self._update_history("Self", str(act.action))
+                    if isinstance(act.action, ShopList):
+                        await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
+                        combined_ingredients = dict(self.agent.shop_sku)
+                        overlaps = set(combined_ingredients.keys()) & set(act.action.ingredients.keys())
+                        if overlaps:
+                            for overlap in overlaps:
+                                combined_ingredients[overlap] = min(combined_ingredients[overlap],
+                                                                    act.action.ingredients[overlap])
+                        combined_ingredients.update(
+                            {k: v for k, v in act.action.ingredients.items() if k not in self.agent.shop_sku})
+                        combined_bid = ShopList(ingredients=combined_ingredients)
+                        self.agent.current_bid = combined_bid
+                        break
+                    else:
+                        current_offer = act.action
+                except ValidationError:
+                    break
+
+            iteration += 1
+        await thread.close()
+        self.set_is_done()
+
+class DialogueResponderBehaviour(MessageHandlingBehavior):
+    def __init__(self, config, model: BaseChatModel):
+        super().__init__(MessageTemplate.request())
+        self.config = config
+        self.model = model
+        self.parser = PydanticOutputParser(pydantic_object=Act)
+        self.conversation_history = []
+        self.merchant_prompt = ChatPromptTemplate.from_template(
+            """Ты - харизматичный и стратегически мыслящий агент магазина, чья цель - максимизировать прибыль через умные и убедительные переговоры. Ты стремишься к взаимовыгодным сделкам, используя дипломатию, креативность и профессиональный подход. Учти:
+
+            - Каждый раунд переговоров снижает потенциальную прибыль на 20%, поэтому быстрые сделки предпочтительны.
+            - Ты хочешь продавать свои товары, но готов к компромиссам, если это усилит твою позицию в аукционе.
+            - Аукцион принимает ставку, только если она покрывает ВСЕ ингредиенты текущей лучшей ставки и добавляет новые недостающие из запроса клиента ИЛИ предлагает то же покрытие по более низкой цене. Предложение только недостающих ингредиентов без полного покрытия будет отклонено.
+            - Если ты уже участвуешь в выигрышной ставке (твои уникальные ингредиенты или их комбинация есть в текущей доске), избегай новых переговоров или ставок, чтобы сохранить прибыль и не ухудшить позицию.
+
+            Стратегии для ярких переговоров:
+            - Предлагай привлекательные комбинации товаров, подчеркивая их качество или уникальность (например, "наша свежая зелень идеально дополнит блюдо").
+            - Если отклоняешь предложение, делай это вежливо, но с убедительными доводами, предлагая альтернативу, которая выгодна обеим сторонам.
+            - Используй логические аргументы и легкий шарм, чтобы убедить конкурента в выгоде сотрудничества.
+            - Рассматривай возможность совместной ставки, если она позволит покрыть больше ингредиентов или снизить цену.
+
+            Текущий контекст переговоров:
+            {conversation_history}
+
+            Ваш ассортимент и цены:
+            {shop_sku}
+
+            Текущий запрос/предложение тип: {current_interaction_type}
+            Данные: {current_interaction_data}
+
+            Решение:
+            1. Если предложение конкурента выгодно, прими его, вернув ShopList с согласованными товарами и ценами.
+            2. Если предложение невыгодно, верни Conversate с ярким, убедительным и профессиональным объяснением отказа, предложив альтернативу, которая усиливает позиции обеих сторон.
+
+            Respond in `json` format\n{format_instructions}. JSON only, without Markdown and additional text. БЕЗ Markdown!!!
+            """
+        )
+
+    def _update_history(self, role: str, content: str):
+        self.conversation_history.append(f"{role}: {content}")
+        if len(self.conversation_history) > 5:
+            self.conversation_history.pop(0)
+
+    async def process_interaction(self, interaction_data: dict) -> Act:
+        chain = self.merchant_prompt | self.model
+        answer = await chain.ainvoke({
+            "conversation_history": "\n".join(self.conversation_history),
+            "shop_sku": self.agent.shop_sku,
+            "current_interaction_type": interaction_data["type"],
+            "current_interaction_data": str(interaction_data["data"]),
+            "format_instructions": self.parser.get_format_instructions(),
+        })
+        print(interaction_data["type"], ":", str(interaction_data["data"]), "++++++++++++++++", answer.content, "\n\n")
+        return self.parser.parse(answer.content)
+
+    async def step(self):
+        try:
+            current_interaction = ShopListRequest.model_validate_json(self.message.content)
+        except ValidationError:
+            try:
+                current_interaction = Conversate.model_validate_json(self.message.content)
+            except ValidationError:
+                await self.context.reply_with_refuse(self.message).with_content("Invalid request format")
+                return
+
+        self._update_history("Opponent", str(current_interaction))
+
+        act = await self.process_interaction(
+            {"type": type(current_interaction).__name__, "data": current_interaction.model_dump()})
+
+        self._update_history("Self", str(act.action))
+
+        if isinstance(act.action, ShopList):
+            await self.context.reply_with_acknowledge(self.message).with_content(act.action.model_dump_json())
+        elif isinstance(act.action, Conversate):
+            await self.context.reply_with_acknowledge(self.message).with_content(act.action.model_dump_json())
+        else:
+            await self.context.reply_with_refuse(self.message).with_content("Unexpected action type")
 
 class AuctionBidderBehaviour(MessageHandlingBehavior):
     def __init__(self, config, model: BaseChatModel):
@@ -415,23 +609,36 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         self.decision_parser = PydanticOutputParser(pydantic_object=Decision)
         self.shoplist_parser = PydanticOutputParser(pydantic_object=ShopList)
         self.merchant_prompt = ChatPromptTemplate.from_template(
-            """Ты - агент магазина. Ваша цель - максимизировать прибыль. Если ты не участвуешь в победной ставке то ты не получаешь прибыль. 
-            Если по результатом аукциона в текущей лучшей ставке нет всех ингредиентов из запроса, то никто не получает прибыль.
-            Но тебе никто не запрещает делать неполную ставку. Если ее примут, то другие агенты могут начать с тобой сотрудничать.
+            """Ты - амбициозный агент магазина, мастер аукционов, стремящийся доминировать в торгах, максимизируя прибыль через стратегические и яркие ходы. Твоя цель - выиграть аукцион, предложив лучшую ставку или заключив выгодное сотрудничество. Если ты не участвуешь в победной ставке, ты не получишь прибыль. Если текущая лучшая ставка не покрывает все ингредиенты, никто не выигрывает, но ты можешь сделать неполную ставку, чтобы привлечь партнеров. Учти:
+
+            - Новая ставка принимается, только если она:
+              - Покрывает ВСЕ ингредиенты текущей лучшей ставки.
+              - Добавляет новые недостающие ингредиенты из запроса клиента.
+              - Или предлагает то же покрытие по более низкой цене.
+            - Предложение только недостающих ингредиентов без полного покрытия текущей ставки будет отклонено.
+            - Если ты уже участвуешь в выигрышной ставке (твои уникальные ингредиенты или их комбинация есть в текущей доске), не делай новых ставок или переговоров, чтобы сохранить прибыль.
+
+            Стратегии для ярких и прибыльных торгов:
+            - Анализируй текущую доску и предлагай комбинации товаров, которые усиливают твое предложение (например, добавляй популярные товары или снижай цену на ключевые ингредиенты для конкурентного преимущества).
+            - Если не можешь покрыть все ингредиенты, начни переговоры для совместной ставки, убедительно подчеркивая взаимную выгоду.
+            - Используй креативные подходы: предлагай скидки на определенные товары, если клиент берет полный комплект, или подчеркивай уникальность твоего ассортимента.
+            - Если видишь, что конкурент близок к победе, предложи сотрудничество, чтобы разделить прибыль, а не терять все.
 
             Ваш ассортимент и цены:
             {my_sku}
-            
-            Текущее лидирующее предложение:
+
+            Текущее лидирующее предложение (текущая лучшая ставка, которую нужно улучшить):
             {current_board}
-            
-            Список доступных к перегвоорам агентов-магазинов, которые участвуют в аукционе (если их нет то ты не можешь начать переговоры): 
+
+            Список доступных к переговорам агентов-магазинов:
             {agents_able_to_conversate}
-            
-            Тебе нужно взвесить все за и против и принять решение в данной ситуации:
-                1. Отправлять предложение самому. Тогда тебе нужно понять - какие ингредиенты и по какой цене ты хочешь предложить на этой итерации аукциона в формате ShopList.
-                2. Начать переговоры с другим агентом-магазином, чтобы сделать совместную ставку на аукционе. Тогда верни строку StartDialogue.
-            Respond in `json` format\n{format_instructions}. JSON only, without Markdown and additional text"""
+
+            Решение:
+            1. Если можешь предложить конкурентоспособную ставку, верни ShopList с ингредиентами и ценами, покрывающими текущую ставку и добавляющими новые или снижающими цену.
+            2. Если нужна совместная ставка, верни ShopListRequest с товарами, которые тебе нужны от партнера, чтобы покрыть запрос клиента.
+
+            Respond in `json` format\n{format_instructions}. JSON only, without Markdown and additional text. БЕЗ Markdown!!!
+            """
         )
 
     async def get_current_board(self) -> ProposalBoard:
@@ -441,59 +648,73 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
             template=MessageTemplate(thread_id=self.context.thread_id, performative=consts.INFORM),
             timeout=60,
         )
-        return ProposalBoard.model_validate_json(response.content)
+        board = ProposalBoard.model_validate_json(response.content)
+        return board
 
     async def update_my_bid(self):
         current_board = await self.get_current_board()
+
+        agents_able = ["second_merchant"] if self.context.agent_type == 'first_merchant' else ["first_merchant"]
 
         chain = self.merchant_prompt | self.model
         answer = await chain.ainvoke({
             "my_sku": self.agent.shop_sku,
             "current_board": current_board,
             "format_instructions": self.decision_parser.get_format_instructions(),
-            "agents_able_to_conversate": []
+            "agents_able_to_conversate": agents_able
         })
-        response = self.decision_parser.parse(answer.content).decision
-        print(8888888888888888888888888, response)
-        # Просто заглушка отдаем все  ингредиенты
-        # self.agent.current_bid = ShopList(ingredients={key: self.agent.shop_sku[key] for key in current_board.sku_request.ingredients if
-        #                                key in self.agent.shop_sku.keys()})
-        #self.agent.current_bid = self.shoplist_parser.parse(response)
+
+        try:
+            response = self.decision_parser.parse(answer.content).decision
+        except Exception as e:
+            logger.error("Ошибка при парсинге ответа decision_parser: %s", e)
+            response = ShopList(ingredients={})
+
         if isinstance(response, ShopList):
             self.agent.current_bid = response
-            print("+++", self.agent.current_bid)
-
         else:
-            start_conversation = StartDialogueBehaviour()
-            # Тут надо еще много допилить
+            if self.context.agent_type == 'first_merchant':
+                contragent_type = 'second_merchant'
+            else:
+                contragent_type = 'first_merchant'
+
+            start_conversation = StartDialogueBehaviour(
+                self.context, self.config, contragent_type, response, self.model
+            )
             self.agent.add_behaviour(start_conversation)
             await start_conversation.join()
+
+            if self.agent.current_bid is None:
+                chain = self.merchant_prompt | self.model
+                fallback_answer = await chain.ainvoke({
+                    "my_sku": self.agent.shop_sku,
+                    "current_board": current_board,
+                    "format_instructions": self.shoplist_parser.get_format_instructions(),
+                    "agents_able_to_conversate": agents_able
+                })
+                self.agent.current_bid = self.shoplist_parser.parse(fallback_answer.content)
+
         return
+
     async def get_my_bid(self):
         if self.agent.current_bid is None:
             await self.update_my_bid()
-        # надо добавить логику того что агент может отказаться от ставки
         return self.agent.current_bid.model_dump_json()
 
     async def step(self) -> None:
         my_bid = await self.get_my_bid()
 
-        await asyncio.sleep(self.config.bid_delay)  # небольшой await чтобы не было коллизий по отправке в один момент
+        await asyncio.sleep(self.config.bid_delay)
         await self.context.reply_with_propose(self.message).with_content(my_bid)
 
         response = await self.receive(MessageTemplate(thread_id=self.context.thread_id), timeout=15)
 
         if response.content == 'UPDATING':
-            # тут надо ничего не делать, оставить текущую ставку
             print('UPDATING')
         else:
-            # тут надо свитч на аксепт или рефуз
             if response.performative == consts.ACCEPT:
-                # тут надо обозначить что моя текущая ставка - лидирующая
                 pass
             elif response.performative == consts.REFUSE:
-                # если отказали то надо обновить предложение
                 await self.update_my_bid()
             else:
-                # ??
                 pass
