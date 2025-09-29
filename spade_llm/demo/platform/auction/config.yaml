@@ -32,6 +32,7 @@ agents:
     args:
       delegate_type: proposal_board
       prompt: Нажмите Enter
+      timeout: 100
   df:
     type_name: spade_llm.demo.platform.contractnet.discovery.DirectoryFacilitatorAgent
 # Agents to wait for before stopping the system. The system stops when all agents from this list are stopped.
