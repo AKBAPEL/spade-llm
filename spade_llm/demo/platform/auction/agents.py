@@ -1,27 +1,24 @@
-from spade_llm.demo.platform.contractnet.contractnet import *
-from typing import Optional, Set
-from asyncio import sleep as asleep
 import asyncio
-from pydantic import ValidationError
-from langchain_core.prompts import ChatPromptTemplate
-from spade_llm.core.api import AgentContext, AgentId
+import logging
+import json
+from typing import Dict, List, Optional, Set, Union
+
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.output_parsers import PydanticOutputParser
-from pydantic import BaseModel
-from pydantic.fields import Field
-from spade_llm.core.agent import Agent
-from spade_llm.core.behaviors import MessageHandlingBehavior, MessageTemplate, ContextBehaviour
-from spade_llm.core.conf import configuration, Configurable
-from spade_llm import consts
-from typing import Union, List, Dict
-from spade_llm.demo.platform.contractnet.discovery import AgentDescription, AgentTask, DF_ADDRESS
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field, ValidationError
 
-import logging
-import time
+from spade_llm import consts
+from spade_llm.core.agent import Agent
+from spade_llm.core.api import AgentContext, AgentId
+from spade_llm.core.behaviors import ContextBehaviour, MessageHandlingBehavior, MessageTemplate
+from spade_llm.core.conf import Configurable, configuration
+from spade_llm.demo.platform.contractnet.contractnet import *
+from spade_llm.demo.platform.contractnet.discovery import AgentDescription, AgentSearchRequest, AgentTask, DF_ADDRESS
 
 logger = logging.getLogger(__name__)
 
-
+# Models for auction data
 class ShopList(BaseModel):
     """List of ingredients with price"""
     ingredients: Dict[str, int] = Field(
@@ -29,14 +26,12 @@ class ShopList(BaseModel):
         default_factory=dict,
     )
 
-
 class ShopListRequest(BaseModel):
     """Request for shop list with ingredients"""
     ingredients: List[str] = Field(
         description="List of ingredients needed",
         default_factory=list
     )
-
 
 class ShopListResponse(BaseModel):
     """Response with total price for ingredients"""
@@ -49,7 +44,6 @@ class ShopListResponse(BaseModel):
         default_factory=list
     )
 
-
 class ProposalBoard(BaseModel):
     agent: str = Field(description="Name of the agent who proposed")
     proposal: ShopList = Field(description="Current best proposal in ShopList format")
@@ -57,14 +51,13 @@ class ProposalBoard(BaseModel):
     round_number: int = Field(default=0, description="Текущий номер раунда аукциона")
     total_rounds: int = Field(default=0, description="Всего раундов аукциона")
 
-
 class ProposalBoardAgentConf(BaseModel):
     total_rounds: int = Field(default=6, description="Общее количество раундов аукциона")
     stable_limit: int = Field(default=3, description="Сколько раундов подряд должна держаться ставка для завершения")
 
-
 @configuration(ProposalBoardAgentConf)
 class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
+    """Agent managing the auction proposal board"""
     proposal_board = ProposalBoard(agent='', proposal=ShopList(), sku_request=ShopListRequest())
 
     class InitialRequestBehaviour(MessageHandlingBehavior):
@@ -80,6 +73,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             self.config = config
 
         async def step(self) -> None:
+            """Run the auction process for the requested ingredients"""
             self.agent.proposal_board.sku_request = ShopListRequest(ingredients=self.ingredients)
             await asyncio.sleep(1)
 
@@ -145,56 +139,61 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             self.config = config
 
         async def step(self):
+            """Reply with the current state of the proposal board"""
             await asyncio.sleep(1)
             await self.context.reply_with_inform(self.message).with_content(self.agent.proposal_board)
 
     def setup(self):
+        """Initialize agent behaviors"""
         self.add_behaviour(self.InitialRequestBehaviour(self.config))
         self.add_behaviour(self.RequestInfoBehaviour(self.config))
-
 
 class FirstMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
     bid_delay: float = Field(default=0, description="Delay between bids")
 
-
 @configuration(FirstMerchantAgentConf)
 class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
+    """Agent representing the first merchant in the auction"""
     shop_sku = {
-        "мясо (говядина)": 350,  # Higher price to encourage competition
-        "свёкла": 50,  # Exclusive to FirstMerchant
+        "мясо (говядина)": 350,
+        "свёкла": 50,
         "морковь": 35,
         "лук репчатый": 25,
         "капуста белокочанная": 85,
         "картофель": 45,
         "томатная паста": 40,
         "чеснок": 20,
-        "уксус (лимонный сок)": 10,  # Exclusive to FirstMerchant
+        "уксус (лимонный сок)": 10,
         "лавровый лист": 5,
         "соль, перец": 10,
         "зелень (укроп/петрушка)": 30
     }
 
-    # Rest of the FirstMerchantAgent implementation remains unchanged
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.current_bid = None
 
     def setup(self):
+        """Initialize agent with auction and dialogue behaviors"""
         asyncio.create_task(self.register_in_df())
-        self.add_behaviour(AuctionBidderBehaviour(config=self.config,
-                                                  model=self.default_context.create_chat_model(
-                                                      self.config.model)))
-        self.add_behaviour(DialogueResponderBehaviour(config=self.config,
-                                                      model=self.default_context.create_chat_model(
-                                                          self.config.model)))
+        self.add_behaviour(AuctionBidderBehaviour(
+            config=self.config,
+            model=self.default_context.create_chat_model(self.config.model)
+        ))
+        self.add_behaviour(DialogueResponderBehaviour(
+            config=self.config,
+            model=self.default_context.create_chat_model(self.config.model)
+        ))
 
     async def register_in_df(self):
+        """Register the agent in the directory facilitator"""
         context = self.default_context
-        await asleep(2)
-        await (context.inform(DF_ADDRESS).with_content(self.create_description()))
+        await asyncio.sleep(2)
+        await context.inform(DF_ADDRESS).with_content(self.create_description())
 
     def create_description(self) -> AgentDescription:
+        """Create a description for the agent"""
         return AgentDescription(
             id="first_merchant",
             description="""Агент-магазин который участвует в аукционе""",
@@ -204,23 +203,23 @@ class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
                     examples=[
                         """
                         class ShopListRequest(BaseModel):
-                            ingredients: List[str] = Field(description="List of ingredients needed")""",
-                    ])
+                            ingredients: List[str] = Field(description="List of ingredients needed")"""
+                    ]
+                )
             ]
         )
-
 
 class SecondMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
     bid_delay: float = Field(default=1.5, description="Delay between bids")
 
-
 @configuration(SecondMerchantAgentConf)
 class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
+    """Agent representing the second merchant in the auction"""
     shop_sku = {
-        "мясо (говядина)": 320,  # Lower price to undercut FirstMerchant
-        "морковь": 30,  # Cheaper than FirstMerchant
-        "лук репчатый": 20,  # Cheaper than FirstMerchant
+        "мясо (говядина)": 320,
+        "морковь": 30,
+        "лук репчатый": 20,
         "капуста белокочанная": 80,
         "картофель": 40,
         "томатная паста": 35,
@@ -228,29 +227,33 @@ class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
         "лавровый лист": 5,
         "соль, перец": 10,
         "зелень (укроп/петрушка)": 25,
-        "сметана": 60  # Exclusive to SecondMerchant
+        "сметана": 60
     }
 
-    # Rest of the SecondMerchantAgent implementation remains unchanged
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.current_bid = None
 
     def setup(self):
+        """Initialize agent with auction and dialogue behaviors"""
         asyncio.create_task(self.register_in_df())
-        self.add_behaviour(AuctionBidderBehaviour(config=self.config,
-                                                  model=self.default_context.create_chat_model(
-                                                      self.config.model)))
-        self.add_behaviour(DialogueResponderBehaviour(config=self.config,
-                                                      model=self.default_context.create_chat_model(
-                                                          self.config.model)))
+        self.add_behaviour(AuctionBidderBehaviour(
+            config=self.config,
+            model=self.default_context.create_chat_model(self.config.model)
+        ))
+        self.add_behaviour(DialogueResponderBehaviour(
+            config=self.config,
+            model=self.default_context.create_chat_model(self.config.model)
+        ))
 
     async def register_in_df(self):
+        """Register the agent in the directory facilitator"""
         context = self.default_context
-        await asleep(3)
-        await (context.inform(DF_ADDRESS).with_content(self.create_description()))
+        await asyncio.sleep(3)
+        await context.inform(DF_ADDRESS).with_content(self.create_description())
 
     def create_description(self) -> AgentDescription:
+        """Create a description for the agent"""
         return AgentDescription(
             id="second_merchant",
             description="""Агент-магазин который участвует в аукционе""",
@@ -260,81 +263,77 @@ class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
                     examples=[
                         """
                         class ShopListRequest(BaseModel):
-                            ingredients: List[str] = Field(description="List of ingredients needed")""",
-                    ])
+                            ingredients: List[str] = Field(description="List of ingredients needed")"""
+                    ]
+                )
             ]
         )
-
 
 class AuctionProposal(BaseModel):
     author: AgentId = Field(description="Name of the agent who proposed", default='')
     prop: ShopList = Field(description="proposal_shoplist")
 
-
 class AuctionContractNetInitiatorBehavior(ContextBehaviour):
+    """Behavior for initiating the contract net protocol in the auction"""
     task: ShopListRequest
     proposal: Optional[ShopList] = None
     result: Optional[MessageTemplate]
     time_to_wait_for_proposals: float
     _started_at: float
 
-    def __init__(self,
-                 task: ShopListRequest,
-                 context: AgentContext,
-                 time_to_wait_for_proposals: float = 10):
+    def __init__(self, task: ShopListRequest, context: AgentContext, time_to_wait_for_proposals: float = 10):
         super().__init__(context)
         self.time_to_wait_for_proposals = time_to_wait_for_proposals
         self.task = task
         self.result = None
 
     async def on_start(self) -> None:
+        """Initialize the start time for the behavior"""
         self._started_at = time.time()
 
     @property
     def is_successful(self) -> bool:
-        if self.result and self.result.performative == consts.INFORM:
-            return True
-        else:
-            return False
+        """Check if the behavior completed successfully"""
+        return bool(self.result and self.result.performative == consts.INFORM)
 
     async def step(self) -> None:
-        agents: List[AgentDescription] = await self.find_agents(self.task)
-
-        if len(agents) > 0:
-            proposals: List[AuctionProposal] = await self.get_proposals(agents)
-            if len(proposals) > 0:
+        """Execute the auction contract net protocol"""
+        agents = await self.find_agents(self.task)
+        if agents:
+            proposals = await self.get_proposals(agents)
+            if proposals:
                 self.proposal = await self.extract_winner_and_notify_losers(proposals)
         self.set_is_done()
 
     async def find_agents(self, task: ShopListRequest) -> List[AgentDescription]:
-        await (self.context
-               .request(DF_ADDRESS)
-               .with_content(AgentSearchRequest(task=task.model_dump_json(), top_k=10)))
-
-        search = await self.receive(MessageTemplate(performative=consts.INFORM, thread_id=self.context.thread_id),
-                                    timeout=10)
-
+        """Find agents capable of fulfilling the task"""
+        await self.context.request(DF_ADDRESS).with_content(AgentSearchRequest(task=task.model_dump_json(), top_k=10))
+        search = await self.receive(
+            MessageTemplate(performative=consts.INFORM, thread_id=self.context.thread_id),
+            timeout=10
+        )
         if search:
             parsed = AgentSearchResponse.model_validate_json(search.content)
             return parsed.agents
-        else:
-            return []
+        return []
 
     async def get_proposals(self, agents: List[AgentDescription]) -> List[AuctionProposal]:
+        """Collect proposals from agents"""
         sent: Set[str] = set()
         received: Set[str] = set()
         result: List[AuctionProposal] = []
 
         for agent in agents:
             sent.add(agent.id)
-            await (self.context.request_proposal(agent.id).with_content(self.task.model_dump_json()))
-        started = time.time()
+            await self.context.request_proposal(agent.id).with_content(self.task.model_dump_json())
 
+        started = time.time()
         deadline = started + self.time_to_wait_for_proposals
         while len(received) < len(sent) and time.time() < deadline:
             response = await self.receive(
                 MessageTemplate(performative=consts.PROPOSE, thread_id=self.context.thread_id),
-                max(0.1, deadline - time.time()))
+                max(0.1, deadline - time.time())
+            )
             if response:
                 received.add(str(response.sender))
                 prop = AuctionProposal(author=response.sender, prop=ShopList.model_validate_json(response.content))
@@ -342,6 +341,7 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
         return result
 
     async def extract_winner_and_notify_losers(self, proposals: List[AuctionProposal]) -> Optional[ShopList]:
+        """Select the winning proposal and notify losers"""
         if not proposals:
             return None
 
@@ -349,39 +349,29 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
         for proposal in proposals:
             if winner is None:
                 current_supply = set(self.agent.proposal_board.proposal.ingredients.keys()).intersection(
-                    set(self.agent.proposal_board.sku_request.ingredients))
+                    set(self.agent.proposal_board.sku_request.ingredients)
+                )
 
-                # Check if proposal is missing any ingredients from the current best
                 if set(current_supply) - set(proposal.prop.ingredients.keys()):
-                    logger.info('Missing some ingredients from the current best. Refusing')
+                    logger.info("Missing ingredients from current best. Refusing")
                     await self.context.refuse(proposal.author).with_content('')
-
-                # Check if proposal has all ingredients plus extra from request
                 elif set(proposal.prop.ingredients.keys()) - set(self.agent.proposal_board.proposal.ingredients.keys()):
-                    logger.info('Has all ingredients plus extra from request. Accepting')
+                    logger.info("Has all ingredients plus extra from request. Accepting")
                     winner = proposal
                     self.agent.proposal_board.proposal = winner.prop
                     await self.context.accept(proposal.author).with_content('')
-
-                # Compare prices if both proposals have the same ingredients
-                elif sum(proposal.prop.ingredients.values()) < sum(
-                        self.agent.proposal_board.proposal.ingredients.values()):
-                    logger.info('Lower price for same ingredients. Accepting')
+                elif sum(proposal.prop.ingredients.values()) < sum(self.agent.proposal_board.proposal.ingredients.values()):
+                    logger.info("Lower price for same ingredients. Accepting")
                     winner = proposal
                     self.agent.proposal_board.proposal = winner.prop
                     await self.context.accept(proposal.author).with_content('')
-
                 else:
-                    logger.info('Higher or equal price, rejecting. Refusing')
+                    logger.info("Higher or equal price, rejecting")
                     await self.context.refuse(proposal.author).with_content('')
             else:
-                logger.info('Already updated board. Refusing')
+                logger.info("Already updated board. Refusing")
                 await self.context.refuse(proposal.author).with_content('UPDATING')
-        if winner is None:
-            return self.agent.proposal_board.proposal
-        else:
-            return winner.prop
-
+        return winner.prop if winner else self.agent.proposal_board.proposal
 
 class Conversate(BaseModel):
     """Offer to another merchant"""
@@ -389,16 +379,13 @@ class Conversate(BaseModel):
         description="деловое предложение конкуренту в формате строки без Markdown"
     )
 
-
 class Act(BaseModel):
     """Action to perform."""
-
     action: Union[ShopList, Conversate] = Field(
-        description="Action to perform. Должно быть БЕЗ Markdown!!!"
+        description="Action to perform. Должно быть БЕЗ Markdown!!! "
                     "Если ты согласен предложить товары по списку из запроса то верни ShopList с ингредиентами и ценами за которые ты готов их продать. "
                     "Если ты не согласен продать только эти товары то верни Conversate с развернутым и аргументированным предложением другому магазину в деловом стиле почему ты хочешь внести изменение в предложение запросившего."
     )
-
 
 class CollaborationProposal(BaseModel):
     """Proposal for collaboration with another agent"""
@@ -409,13 +396,16 @@ class CollaborationProposal(BaseModel):
         description="ShopList с теми товарами и ценами которые тебе нужны для совместной ставки"
     )
 
-
 class Decision(BaseModel):
-    decision: Union[ShopList, CollaborationProposal] = Field(description="Decision to perform. Должно быть БЕЗ Markdown!!!"
-                                                                   "Если ты согласен предложить товары по списку из запроса то верни ShopList с ингредиентами и ценами за которые ты готов их продать. "
-                                                                   "Если ты хочешь начать переговоры с другим агентом для совместной ставки то верни CollaborationProposal с target_agent (agent_type партнера) и needed_ingredients (ShopList с теми товарами и ценами которые тебе нужны).")
+    """Decision to perform."""
+    decision: Union[ShopList, CollaborationProposal] = Field(
+        description="Decision to perform. Должно быть БЕЗ Markdown!!! "
+                    "Если ты согласен предложить товары по списку из запроса то верни ShopList с ингредиентами и ценами за которые ты готов их продать. "
+                    "Если ты хочешь начать переговоры с другим агентом для совместной ставки то верни CollaborationProposal с target_agent (agent_type партнера) и needed_ingredients (ShopList с теми товарами и ценами которые тебе нужны)."
+    )
 
 class StartDialogueBehaviour(ContextBehaviour):
+    """Behavior for initiating a dialogue with another merchant"""
     def __init__(self, context: AgentContext, config, contragent: str, needed_ingredients: ShopList,
                  model: BaseChatModel):
         super().__init__(context)
@@ -424,8 +414,9 @@ class StartDialogueBehaviour(ContextBehaviour):
         self.needed_ingredients = needed_ingredients
         self.model = model
         self.conversation_history = []
-
         self.parser = PydanticOutputParser(pydantic_object=Act)
+        self.shoplist_parser = PydanticOutputParser(pydantic_object=ShopList)
+        self.conversate_parser = PydanticOutputParser(pydantic_object=Conversate)
         self.merchant_prompt = ChatPromptTemplate.from_template(
             """Ты - опытный агент магазина, мастер переговоров, стремящийся максимизировать прибыль с изяществом и стратегическим чутьем. 
             Твоя цель - заключить сделку, которая принесет максимальную выгоду, но при этом ты должен оставаться убедительным, профессиональным и гибким.
@@ -460,33 +451,55 @@ class StartDialogueBehaviour(ContextBehaviour):
         )
 
     def _update_history(self, role: str, content: Union[ShopList, Conversate]):
+        """Update conversation history with new message"""
         self.conversation_history.append(f"{role}: {content.model_dump_json()}")
         if len(self.conversation_history) > 5:
             self.conversation_history.pop(0)
 
     def _save_dialogue(self):
+        """Save the conversation history to a file"""
         import os
+        import json
         os.makedirs("dialogues", exist_ok=True)
-        filename = f"dialogue_start_{time.time()}.txt"  # Уникальное имя с префиксом для стартера
+        filename = f"dialogue_start_{time.time()}.txt"
         path = os.path.join("dialogues", filename)
+
+        def parse_saved_content(content: str) -> tuple[str, str]:
+            """Parse content to determine its type and format for saving"""
+            try:
+                data = json.loads(content)
+                if 'offer' in data:
+                    try:
+                        conversate = Conversate.model_validate(data)
+                        return "Conversate", conversate.offer
+                    except ValidationError:
+                        pass
+                if 'ingredients' in data:
+                    try:
+                        shop_list = ShopList.model_validate(data)
+                        return "ShopList", str(shop_list.ingredients)
+                    except ValidationError:
+                        pass
+            except json.JSONDecodeError:
+                pass
+            return "Unknown", content
+
         with open(path, "w", encoding="utf-8") as f:
             for entry in self.conversation_history:
-                role, content = entry.split(": ", 1)
                 try:
-                    shop_list = ShopList.model_validate_json(content)
-                    f.write(f"{role} (ShopList): {shop_list.ingredients}\n")
-                except:
-                    try:
-                        conversate = Conversate.model_validate_json(content)
-                        f.write(f"{role} (Conversate): {conversate.offer}\n")
-                    except:
-                        f.write(f"{role} (Unknown): {content}\n")
+                    role, content = entry.split(": ", 1)
+                    msg_type, display_content = parse_saved_content(content)
+                    f.write(f"{role} ({msg_type}): {display_content}\n")
+                except Exception:
+                    f.write(f"ParseError: {entry}\n")
+
         logger.info("Saved dialogue to %s (lines: %d)", path, len(self.conversation_history))
 
     async def process_response(self, interaction_data: dict) -> Act:
+        """Process incoming interaction and generate a response"""
         def clean_json(text: str) -> str:
             text = text.strip()
-            if text.startswith("```json"):
+            if text.startswith("```json\n"):
                 text = text[7:]
             if text.endswith("```"):
                 text = text[:-3]
@@ -501,17 +514,15 @@ class StartDialogueBehaviour(ContextBehaviour):
             "format_instructions": self.parser.get_format_instructions(),
         })
         cleaned_content = clean_json(answer.content)
-        print(interaction_data["type"], ":", str(interaction_data["data"]), "++++++++++++++++", cleaned_content, "\n\n")
         return self.parser.parse(cleaned_content)
 
     async def step(self):
-        logger.info("Начался диалог с %s", self.contragent)
+        """Execute the dialogue process"""
+        logger.info("Starting dialogue with %s", self.contragent)
         thread = await self.context.fork_thread()
-        max_iterations = 5
+        max_iterations = 10
         iteration = 0
-
         self._update_history("Self", self.needed_ingredients)
-
         current_offer = self.needed_ingredients
 
         while iteration < max_iterations:
@@ -525,50 +536,48 @@ class StartDialogueBehaviour(ContextBehaviour):
                 template=MessageTemplate(thread_id=thread.thread_id, performative=consts.ACKNOWLEDGE),
                 timeout=60
             )
-
             if not response:
                 logger.warning("No response from %s", self.contragent)
                 break
 
             try:
-                competitor_msg = ShopList.model_validate_json(response.content)
-                msg_type = "ShopList"
-            except:
-                try:
+                content_dict = json.loads(response.content)
+                if "ingredients" in content_dict:
+                    competitor_msg = ShopList.model_validate_json(response.content)
+                    msg_type = "ShopList"
+                elif "offer" in content_dict:
                     competitor_msg = Conversate.model_validate_json(response.content)
                     msg_type = "Conversate"
-                except:
-                    logger.error("Unrecognized message format from %s", self.contragent)
+                else:
+                    logger.error("Unrecognized message format from %s: %s", self.contragent, response.content)
                     break
+            except json.JSONDecodeError:
+                logger.error("Invalid JSON format from %s: %s", self.contragent, response.content)
+                break
 
             self._update_history("Opponent", competitor_msg)
-
             if isinstance(competitor_msg, ShopList):
                 combined_ingredients = dict(self.agent.shop_sku)
                 overlaps = set(combined_ingredients.keys()) & set(competitor_msg.ingredients.keys())
                 for overlap in overlaps:
-                    combined_ingredients[overlap] = min(combined_ingredients[overlap],
-                                                       competitor_msg.ingredients[overlap])
+                    combined_ingredients[overlap] = min(combined_ingredients[overlap], competitor_msg.ingredients[overlap])
                 combined_ingredients.update(
                     {k: v for k, v in competitor_msg.ingredients.items() if k not in self.agent.shop_sku}
                 )
                 self.agent.current_bid = ShopList(ingredients=combined_ingredients)
                 break
-
             elif isinstance(competitor_msg, Conversate):
                 act = await self.process_response({
                     "type": msg_type,
                     "data": competitor_msg.model_dump()
                 })
                 self._update_history("Self", act.action)
-
                 if isinstance(act.action, ShopList):
                     await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
                     combined_ingredients = dict(self.agent.shop_sku)
                     overlaps = set(combined_ingredients.keys()) & set(act.action.ingredients.keys())
                     for overlap in overlaps:
-                        combined_ingredients[overlap] = min(combined_ingredients[overlap],
-                                                           act.action.ingredients[overlap])
+                        combined_ingredients[overlap] = min(combined_ingredients[overlap], act.action.ingredients[overlap])
                     combined_ingredients.update(
                         {k: v for k, v in act.action.ingredients.items() if k not in self.agent.shop_sku}
                     )
@@ -579,7 +588,6 @@ class StartDialogueBehaviour(ContextBehaviour):
                 else:
                     logger.warning("Unexpected action type: %s", type(act.action))
                     break
-
             iteration += 1
 
         await thread.close()
@@ -587,6 +595,7 @@ class StartDialogueBehaviour(ContextBehaviour):
         self.set_is_done()
 
 class DialogueResponderBehaviour(MessageHandlingBehavior):
+    """Behavior for responding to dialogue requests from other merchants"""
     def __init__(self, config, model: BaseChatModel):
         super().__init__(MessageTemplate.request())
         self.config = config
@@ -615,8 +624,8 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             Ваш ассортимент и цены:
             {shop_sku}
 
-            Текущий запрос/предложение тип: {current_interaction_type}
-            Данные: {current_interaction_data}
+            Текущий запрос/предложение тип: {current_interaction_type} - Если это ShopList то от вас хотят ингердиенты из содержания. Если Conversate то вам пришло текстовое сообщение.
+            Содержание запроса: {current_interaction_data}
 
             Решение:
             1. Если предложение конкурента выгодно, прими его, вернув ShopList с согласованными товарами и ценами.
@@ -627,11 +636,13 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         )
 
     def _update_history(self, role: str, content: str):
+        """Update conversation history with new message"""
         self.conversation_history.append(f"{role}: {content}")
         if len(self.conversation_history) > 5:
             self.conversation_history.pop(0)
 
     async def process_interaction(self, interaction_data: dict) -> Act:
+        """Process incoming interaction and generate a response"""
         chain = self.merchant_prompt | self.model
         answer = await chain.ainvoke({
             "conversation_history": "\n".join(self.conversation_history),
@@ -640,24 +651,45 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             "current_interaction_data": str(interaction_data["data"]),
             "format_instructions": self.parser.get_format_instructions(),
         })
-        print(interaction_data["type"], ":", str(interaction_data["data"]), "++++++++++++++++", answer.content, "\n\n")
         return self.parser.parse(answer.content)
 
     async def step(self):
+        """Handle incoming dialogue request"""
+
+        def clean_json(text: str) -> str:
+            text = text.strip()
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.endswith("```"):
+                text = text[:-3]
+            return text.strip()
+
+        cleaned_content = clean_json(self.message.content)
+
+        # Сначала проверяем структуру JSON
         try:
-            current_interaction = ShopList.model_validate_json(self.message.content)
-        except ValidationError:
-            try:
-                current_interaction = Conversate.model_validate_json(self.message.content)
-            except ValidationError:
-                await self.context.reply_with_refuse(self.message).with_content("Invalid request format")
+            import json
+            data = json.loads(cleaned_content)
+
+            # Если есть поле 'offer' - это Conversate
+            if 'offer' in data:
+                current_interaction = Conversate.model_validate(data)
+            # Если есть поле 'ingredients' - это ShopList
+            elif 'ingredients' in data:
+                current_interaction = ShopList.model_validate(data)
+            else:
+                # Если нет ожидаемых полей - ошибка
+                await self.context.reply_with_refuse(self.message).with_content(
+                    "Invalid request format: missing required fields")
                 return
 
+        except json.JSONDecodeError:
+            pass
+
         self._update_history("Opponent", str(current_interaction))
-
         act = await self.process_interaction(
-            {"type": type(current_interaction).__name__, "data": current_interaction.model_dump()})
-
+            {"type": type(current_interaction).__name__, "data": current_interaction.model_dump()}
+        )
         self._update_history("Self", str(act.action))
 
         if isinstance(act.action, ShopList):
@@ -667,13 +699,12 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         else:
             await self.context.reply_with_refuse(self.message).with_content("Unexpected action type")
 
-
 class AuctionBidderBehaviour(MessageHandlingBehavior):
+    """Behavior for handling auction bidding"""
     def __init__(self, config, model: BaseChatModel):
         super().__init__(MessageTemplate.request_proposal())
         self.config = config
         self.model = model
-
         self.decision_parser = PydanticOutputParser(pydantic_object=Decision)
         self.shoplist_parser = PydanticOutputParser(pydantic_object=ShopList)
         self.merchant_prompt = ChatPromptTemplate.from_template(
@@ -711,22 +742,21 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         )
 
     async def get_current_board(self) -> ProposalBoard:
-        await asleep(self.config.bid_delay)
+        """Retrieve the current state of the proposal board"""
+        await asyncio.sleep(self.config.bid_delay)
         await self.context.acknowledge('proposal_board').with_content('')
         response = await self.receive(
             template=MessageTemplate(thread_id=self.context.thread_id, performative=consts.INFORM),
             timeout=60,
         )
-        board = ProposalBoard.model_validate_json(response.content)
-        return board
+        return ProposalBoard.model_validate_json(response.content)
 
     async def update_my_bid(self):
+        """Update the agent's current bid based on the board state"""
         current_board = await self.get_current_board()
-
         agents_able = ["second_merchant"] if self.context.agent_type == 'first_merchant' else ["first_merchant"]
-
         chain = self.merchant_prompt | self.model
-        await asleep(self.config.bid_delay)
+        await asyncio.sleep(self.config.bid_delay)
         answer = await chain.ainvoke({
             "my_sku": self.agent.shop_sku,
             "current_board": current_board,
@@ -736,7 +766,7 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         try:
             response = self.decision_parser.parse(answer.content).decision
         except Exception as e:
-            logger.error("Ошибка при парсинге ответа decision_parser: %s", e)
+            logger.error("Error parsing decision: %s", e)
             response = ShopList(ingredients={})
 
         if isinstance(response, ShopList):
@@ -744,16 +774,14 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         elif isinstance(response, CollaborationProposal):
             contragent = response.target_agent
             needed = response.needed_ingredients
-
             start_conversation = StartDialogueBehaviour(
                 self.context, self.config, contragent, needed, self.model
             )
             self.agent.add_behaviour(start_conversation)
             await start_conversation.join()
-
             if self.agent.current_bid is None:
                 chain = self.merchant_prompt | self.model
-                await asleep(self.config.bid_delay)
+                await asyncio.sleep(self.config.bid_delay)
                 fallback_answer = await chain.ainvoke({
                     "my_sku": self.agent.shop_sku,
                     "current_board": current_board,
@@ -762,26 +790,22 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
                 })
                 self.agent.current_bid = self.shoplist_parser.parse(fallback_answer.content)
 
-        return
-
     async def get_my_bid(self):
+        """Generate and return the agent's current bid"""
         await self.update_my_bid()
         return self.agent.current_bid.model_dump_json()
 
     async def step(self) -> None:
+        """Handle the bidding process"""
         my_bid = await self.get_my_bid()
-
         await asyncio.sleep(self.config.bid_delay)
         await self.context.reply_with_propose(self.message).with_content(my_bid)
-
         response = await self.receive(MessageTemplate(thread_id=self.context.thread_id), timeout=15)
-
         if response.content == 'UPDATING':
-            print('UPDATING')
+            logger.info("Received UPDATING response")
+        elif response.performative == consts.ACCEPT:
+            pass
+        elif response.performative == consts.REFUSE:
+            await self.update_my_bid()
         else:
-            if response.performative == consts.ACCEPT:
-                pass
-            elif response.performative == consts.REFUSE:
-                await self.update_my_bid()
-            else:
-                pass
+            pass
