@@ -49,7 +49,7 @@ class ShopListResponse(BaseModel):
 
 
 class ProposalBoard(BaseModel):
-    agent: str = Field(description="Name of the agent who proposed")
+    agents: List[str] = Field(default_factory=list, description="Names of the agents who proposed")
     proposal: ShopList = Field(description="Current best proposal in ShopList format")
     sku_request: ShopListRequest = Field(description="User sku`s request")
     round_number: int = Field(default=0, description="Текущий номер раунда аукциона")
@@ -64,7 +64,7 @@ class ProposalBoardAgentConf(BaseModel):
 @configuration(ProposalBoardAgentConf)
 class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
     """Agent managing the auction proposal board"""
-    proposal_board = ProposalBoard(agent='', proposal=ShopList(), sku_request=ShopListRequest())
+    proposal_board = ProposalBoard(agents=[], proposal=ShopList(), sku_request=ShopListRequest())
 
     class InitialRequestBehaviour(MessageHandlingBehavior):
         ingredients = [
@@ -180,7 +180,8 @@ class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.current_bid = None
+        self.current_bid: Optional[AuctionProposal] = None
+        self.collaborators: Optional[List[str]] = None
 
     def setup(self):
         """Initialize agent with auction and dialogue behaviors"""
@@ -242,7 +243,8 @@ class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.current_bid = None
+        self.current_bid: Optional[AuctionProposal] = None
+        self.collaborators: Optional[List[str]] = None
 
     def setup(self):
         """Initialize agent with auction and dialogue behaviors"""
@@ -281,7 +283,7 @@ class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
 
 
 class AuctionProposal(BaseModel):
-    author: AgentId = Field(description="Name of the agent who proposed", default='')
+    authors: List[str] = Field(description="Names of the agents who proposed", default_factory=list)
     prop: ShopList = Field(description="proposal_shoplist")
 
 
@@ -329,11 +331,11 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
             return parsed.agents
         return []
 
-    async def get_proposals(self, agents: List[AgentDescription]) -> List[AuctionProposal]:
+    async def get_proposals(self, agents: List[AgentDescription]) -> List[tuple[str, AuctionProposal]]:
         """Collect proposals from agents"""
         sent: Set[str] = set()
         received: Set[str] = set()
-        result: List[AuctionProposal] = []
+        result: List[tuple[str, AuctionProposal]] = []
 
         for agent in agents:
             sent.add(agent.id)
@@ -347,43 +349,48 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
                 max(0.1, deadline - time.time())
             )
             if response:
-                received.add(str(response.sender))
-                prop = AuctionProposal(author=response.sender, prop=ShopList.model_validate_json(response.content))
-                result.append(prop)
+                received.add(response.sender.agent_type)
+                prop = AuctionProposal.model_validate_json(response.content)
+                result.append((response.sender.agent_type, prop))
         return result
 
-    async def extract_winner_and_notify_losers(self, proposals: List[AuctionProposal]) -> Optional[ShopList]:
+    async def extract_winner_and_notify_losers(self, proposals: List[tuple[str, AuctionProposal]]) -> Optional[
+        ShopList]:
         """Select the winning proposal and notify losers"""
         if not proposals:
             return None
 
+        winner_sender = None
         winner = None
-        for proposal in proposals:
+        for sender, proposal in proposals:
             if winner is None:
                 current_supply = set(self.agent.proposal_board.proposal.ingredients.keys()).intersection(
                     set(self.agent.proposal_board.sku_request.ingredients)
                 )
+                proposed_supply = set(proposal.prop.ingredients.keys()).intersection(
+                    set(self.agent.proposal_board.sku_request.ingredients)
+                )
 
-                if set(current_supply) - set(proposal.prop.ingredients.keys()):
+                if not current_supply.issubset(proposed_supply):
                     logger.info("Missing ingredients from current best. Refusing")
-                    await self.context.refuse(proposal.author).with_content('')
-                elif set(proposal.prop.ingredients.keys()) - set(self.agent.proposal_board.proposal.ingredients.keys()):
-                    logger.info("Has all ingredients plus extra from request. Accepting")
+                    await self.context.refuse(sender).with_content('')
+                elif len(proposed_supply) > len(current_supply) or (
+                        len(proposed_supply) == len(current_supply) and
+                        sum(proposal.prop.ingredients.values()) < sum(
+                    self.agent.proposal_board.proposal.ingredients.values())
+                ):
+                    logger.info("Better coverage or lower price. Accepting")
                     winner = proposal
+                    winner_sender = sender
                     self.agent.proposal_board.proposal = winner.prop
-                    await self.context.accept(proposal.author).with_content('')
-                elif sum(proposal.prop.ingredients.values()) < sum(
-                        self.agent.proposal_board.proposal.ingredients.values()):
-                    logger.info("Lower price for same ingredients. Accepting")
-                    winner = proposal
-                    self.agent.proposal_board.proposal = winner.prop
-                    await self.context.accept(proposal.author).with_content('')
+                    self.agent.proposal_board.agents = winner.authors
+                    await self.context.accept(sender).with_content('')
                 else:
-                    logger.info("Higher or equal price, rejecting")
-                    await self.context.refuse(proposal.author).with_content('')
+                    logger.info("Not better, rejecting")
+                    await self.context.refuse(sender).with_content('')
             else:
                 logger.info("Already updated board. Refusing")
-                await self.context.refuse(proposal.author).with_content('UPDATING')
+                await self.context.refuse(sender).with_content('UPDATING')
         return winner.prop if winner else self.agent.proposal_board.proposal
 
 
@@ -448,8 +455,10 @@ class StartDialogueBehaviour(ContextBehaviour):
         """Save the conversation history to a file"""
         import os
         import json
+        from datetime import datetime
         os.makedirs("dialogues", exist_ok=True)
-        filename = f"dialogue_start_{time.time()}.txt"
+        timestamp = datetime.now().strftime("%d-%H-%M-%S-%f")
+        filename = f"dialogue_start_{timestamp}.txt"
         path = os.path.join("dialogues", filename)
 
         def parse_saved_content(content: str) -> tuple[str, str]:
@@ -525,7 +534,6 @@ class StartDialogueBehaviour(ContextBehaviour):
                 template=MessageTemplate(thread_id=thread.thread_id, performative=consts.ACKNOWLEDGE),
                 timeout=60
             )
-            # TODO: check if response is Refuse and break
             if not response:
                 logger.warning("No response from %s", self.contragent)
                 break
@@ -555,7 +563,11 @@ class StartDialogueBehaviour(ContextBehaviour):
                 combined_ingredients.update(
                     {k: v for k, v in competitor_msg.ingredients.items() if k not in self.agent.shop_sku}
                 )
-                self.agent.current_bid = ShopList(ingredients=combined_ingredients)
+                self.agent.collaborators = sorted([self.context.agent_type, self.contragent])
+                self.agent.current_bid = AuctionProposal(
+                    authors=self.agent.collaborators,
+                    prop=ShopList(ingredients=combined_ingredients)
+                )
                 break
             elif isinstance(competitor_msg, Conversate):
                 act = await self.process_response({
@@ -563,20 +575,13 @@ class StartDialogueBehaviour(ContextBehaviour):
                     "data": competitor_msg.model_dump()
                 })
                 self._update_history("Self", act.action)
+                current_offer = act.action
                 if isinstance(act.action, ShopList):
                     await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
-                    combined_ingredients = dict(self.agent.shop_sku)
-                    overlaps = set(combined_ingredients.keys()) & set(act.action.ingredients.keys())
-                    for overlap in overlaps:
-                        combined_ingredients[overlap] = min(combined_ingredients[overlap],
-                                                            act.action.ingredients[overlap])
-                    combined_ingredients.update(
-                        {k: v for k, v in act.action.ingredients.items() if k not in self.agent.shop_sku}
-                    )
-                    self.agent.current_bid = ShopList(ingredients=combined_ingredients)
-                    break
+                    # Не комбинируем здесь, ждем ответа от opponent
+                    # Break убран, чтобы продолжить цикл и получить ответ
                 elif isinstance(act.action, Conversate):
-                    current_offer = act.action
+                    await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
                 else:
                     logger.warning("Unexpected action type: %s", type(act.action))
                     break
@@ -657,6 +662,10 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
 
         if isinstance(act.action, ShopList):
             await self.context.reply_with_acknowledge(self.message).with_content(act.action.model_dump_json())
+            self.agent.current_bid = AuctionProposal(
+                authors=[self.context.agent_type],
+                prop=act.action
+            )
         elif isinstance(act.action, Conversate):
             await self.context.reply_with_acknowledge(self.message).with_content(act.action.model_dump_json())
         else:
@@ -687,41 +696,53 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
     async def update_my_bid(self):
         """Update the agent's current bid based on the board state"""
         current_board = await self.get_current_board()
-        agents_able = ["second_merchant"] if self.context.agent_type == 'first_merchant' else ["first_merchant"]
-        chain = self.merchant_prompt | self.model
-        await asyncio.sleep(self.config.bid_delay)
-        answer = await chain.ainvoke({
-            "my_sku": self.agent.shop_sku,
-            "current_board": current_board,
-            "format_instructions": self.decision_parser.get_format_instructions(),
-            "agents_able_to_conversate": agents_able
-        })
-        try:
-            response = self.decision_parser.parse(answer.content).decision
-        except Exception as e:
-            logger.error("Error parsing decision: %s", e)
-            response = ShopList(ingredients={})
+        if self.context.agent_type not in current_board.agents:
+            # Если агент участвует в текущей лидирующей ставке, то ему нет смысла изменять ставку.
+            # В противоположном случае пытаемся улучшить ставку
 
-        if isinstance(response, ShopList):
-            self.agent.current_bid = response
-        elif isinstance(response, CollaborationProposal):
-            contragent = response.target_agent
-            needed = response.needed_ingredients
-            start_conversation = StartDialogueBehaviour(
-                self.context, self.config, contragent, needed, self.model
-            )
-            self.agent.add_behaviour(start_conversation)
-            await start_conversation.join()
-            if self.agent.current_bid is None:
-                chain = self.merchant_prompt | self.model
-                await asyncio.sleep(self.config.bid_delay)
-                fallback_answer = await chain.ainvoke({
-                    "my_sku": self.agent.shop_sku,
-                    "current_board": current_board,
-                    "format_instructions": self.shoplist_parser.get_format_instructions(),
-                    "agents_able_to_conversate": agents_able
-                })
-                self.agent.current_bid = self.shoplist_parser.parse(fallback_answer.content)
+            agents_able = ["second_merchant"] if self.context.agent_type == 'first_merchant' else ["first_merchant"]
+            chain = self.merchant_prompt | self.model
+            await asyncio.sleep(self.config.bid_delay)
+            answer = await chain.ainvoke({
+                "my_sku": self.agent.shop_sku,
+                "current_board": current_board,
+                "format_instructions": self.decision_parser.get_format_instructions(),
+                "agents_able_to_conversate": agents_able
+            })
+            try:
+                response = self.decision_parser.parse(answer.content).decision
+            except Exception as e:
+                logger.error("Error parsing decision: %s", e)
+                response = ShopList(ingredients={})
+
+            if isinstance(response, ShopList):
+                self.agent.current_bid = AuctionProposal(
+                    authors=[self.context.agent_type],
+                    prop=response
+                )
+            elif isinstance(response, CollaborationProposal):
+                contragent = response.target_agent
+                needed = response.needed_ingredients
+                start_conversation = StartDialogueBehaviour(
+                    self.context, self.config, contragent, needed, self.model
+                )
+                self.agent.add_behaviour(start_conversation)
+                await start_conversation.join()
+                if self.agent.current_bid is None:
+                    chain = self.merchant_prompt | self.model
+                    await asyncio.sleep(self.config.bid_delay)
+                    fallback_answer = await chain.ainvoke({
+                        "my_sku": self.agent.shop_sku,
+                        "current_board": current_board,
+                        "format_instructions": self.shoplist_parser.get_format_instructions(),
+                        "agents_able_to_conversate": agents_able,
+                        "self_type": self.context.agent_type
+                    })
+                    fallback_prop = self.shoplist_parser.parse(fallback_answer.content)
+                    self.agent.current_bid = AuctionProposal(
+                        authors=[self.context.agent_type],
+                        prop=fallback_prop
+                    )
 
     async def get_my_bid(self):
         """Generate and return the agent's current bid"""
