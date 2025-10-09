@@ -432,8 +432,8 @@ class Decision(BaseModel):
 class StartDialogueBehaviour(ContextBehaviour):
     """Behavior for initiating a dialogue with another merchant"""
 
-    def __init__(self, context: AgentContext, config, contragent: str, needed_ingredients: ShopList,
-                 model: BaseChatModel):
+    def __init__(self, context: AgentContext, config, contragent: str,
+                 needed_ingredients: ShopList, model: BaseChatModel):
         super().__init__(context)
         self.config = config
         self.contragent = contragent
@@ -445,38 +445,92 @@ class StartDialogueBehaviour(ContextBehaviour):
         self.conversate_parser = PydanticOutputParser(pydantic_object=Conversate)
         self.merchant_prompt = DIALOGUE_INITIATOR_PROMPT
 
-    def _update_history(self, role: str, content: Union[ShopList, Conversate]):
-        """Update conversation history with new message"""
-        self.conversation_history.append(f"{role}: {content.model_dump_json()}")
-        if len(self.conversation_history) > 5:
+    # -----------------------
+    # JSON УТИЛИТЫ
+    # -----------------------
+    def clean_json(self, text: str) -> str:
+        """Удаляет markdown-блоки и возвращает чистый JSON"""
+        text = text.strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            text = text[start:end + 1]
+        return text.strip()
+
+    def safe_json_load(self, text: str) -> dict:
+        """Безопасная загрузка JSON с несколькими попытками восстановления"""
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            trimmed = text.split("}")[:-1]
+            for i in range(len(trimmed), 0, -1):
+                candidate = "}".join(trimmed[:i]) + "}"
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+        return {}
+
+    def fix_act_json(self, data: dict) -> dict:
+        """Исправляет структуру JSON от LLM, чтобы гарантировать Act(action={...})"""
+        if not isinstance(data, dict):
+            return {"action": {"offer": str(data)}}
+
+        action = data.get("action")
+
+        # если LLM не добавил action
+        if action is None:
+            if "offer" in data:
+                return {"action": {"offer": data["offer"]}}
+            if "ingredients" in data:
+                return {"action": {"ingredients": data["ingredients"]}}
+            return {"action": {"offer": str(data)}}
+
+        # если action — строка (Conversate)
+        if isinstance(action, str):
+            return {"action": {"offer": action}}
+
+        # если словарь с ингредиентами
+        if isinstance(action, dict):
+            if "ingredients" in action:
+                return {"action": {"ingredients": action["ingredients"]}}
+            if "offer" in action:
+                return {"action": {"offer": action["offer"]}}
+            if all(isinstance(v, (int, float)) for v in action.values()):
+                return {"action": {"ingredients": action}}
+            if all(isinstance(v, str) for v in action.values()):
+                return {"action": {"offer": " ".join(action.values())}}
+
+        # fallback
+        return {"action": {"offer": str(action)}}
+
+    # -----------------------
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+    # -----------------------
+    def _update_history(self, role: str, content: Union[ShopList, Conversate, Act]):
+        """Добавляет запись в историю диалога"""
+        msg = content.model_dump_json() if hasattr(content, "model_dump_json") else str(content)
+        self.conversation_history.append(f"{role}: {msg}")
+        if len(self.conversation_history) > 10:
             self.conversation_history.pop(0)
 
     def _save_dialogue(self):
-        """Save the conversation history to a file"""
-        import os
-        import json
+        """Сохраняет историю диалога в файл"""
+        import os, json
         from datetime import datetime
         os.makedirs("dialogues", exist_ok=True)
         timestamp = datetime.now().strftime("%d-%H-%M-%S-%f")
         filename = f"dialogue_start_{timestamp}.txt"
         path = os.path.join("dialogues", filename)
 
-        def parse_saved_content(content: str) -> tuple[str, str]:
-            """Parse content to determine its type and format for saving"""
+        def parse_saved(content: str):
             try:
                 data = json.loads(content)
-                if 'offer' in data:
-                    try:
-                        conversate = Conversate.model_validate(data)
-                        return "Conversate", conversate.offer
-                    except ValidationError:
-                        pass
-                if 'ingredients' in data:
-                    try:
-                        shop_list = ShopList.model_validate(data)
-                        return "ShopList", str(shop_list.ingredients)
-                    except ValidationError:
-                        pass
+                if "offer" in data:
+                    return "Conversate", data["offer"]
+                if "ingredients" in data:
+                    return "ShopList", str(data["ingredients"])
             except json.JSONDecodeError:
                 pass
             return "Unknown", content
@@ -485,24 +539,18 @@ class StartDialogueBehaviour(ContextBehaviour):
             for entry in self.conversation_history:
                 try:
                     role, content = entry.split(": ", 1)
-                    msg_type, display_content = parse_saved_content(content)
-                    f.write(f"{role} ({msg_type}): {display_content}\n")
+                    msg_type, display = parse_saved(content)
+                    f.write(f"{role} ({msg_type}): {display}\n")
                 except Exception:
                     f.write(f"ParseError: {entry}\n")
 
-        logger.info("Saved dialogue to %s (lines: %d)", path, len(self.conversation_history))
+        logger.info("Saved dialogue to %s", path)
 
+    # -----------------------
+    # ГЛАВНАЯ ЛОГИКА
+    # -----------------------
     async def process_response(self, interaction_data: dict) -> Act:
-        """Process incoming interaction and generate a response"""
-
-        def clean_json(text: str) -> str:
-            text = text.strip()
-            if text.startswith("```json\n"):
-                text = text[7:]
-            if text.endswith("```"):
-                text = text[:-3]
-            return text.strip()
-
+        """Обрабатывает ответ контрагента через модель"""
         chain = self.merchant_prompt | self.model
         answer = await chain.ainvoke({
             "conversation_history": "\n".join(self.conversation_history),
@@ -511,80 +559,113 @@ class StartDialogueBehaviour(ContextBehaviour):
             "current_interaction_data": str(interaction_data["data"]),
             "format_instructions": self.parser.get_format_instructions(),
         })
-        cleaned_content = clean_json(answer.content)
-        return self.parser.parse(cleaned_content)
+
+        #print("==== RAW LLM RESPONSE INITIATOR ====")
+        #print(answer.content)
+
+        cleaned = self.clean_json(answer.content)
+        data = self.safe_json_load(cleaned)
+        fixed = self.fix_act_json(data)
+
+        try:
+            return self.parser.parse(json.dumps(fixed))
+        except Exception as e:
+            logger.error("Error parsing act: %s\nRecovered JSON: %s", e, fixed)
+            return Act(action=Conversate(offer="Извините, я не смог корректно ответить."))
 
     async def step(self):
-        """Execute the dialogue process"""
+        """Основной процесс инициации диалога"""
         logger.info("Starting dialogue with %s", self.contragent)
         thread = await self.context.fork_thread()
         max_iterations = 10
         iteration = 0
+
+        # начинаем с исходного ShopList-запроса
         self._update_history("Self", self.needed_ingredients)
         current_offer = self.needed_ingredients
 
         while iteration < max_iterations:
+            # отправка текущего предложения
             if isinstance(current_offer, (ShopList, Conversate)):
                 await thread.request(self.contragent).with_content(current_offer.model_dump_json())
             else:
                 logger.warning("Unexpected offer type: %s", type(current_offer))
                 break
 
+            # ожидание ответа
             response = await self.receive(
-                template=MessageTemplate(thread_id=thread.thread_id, performative=consts.ACKNOWLEDGE),
+                template=MessageTemplate(thread_id=thread.thread_id,
+                                         performative=consts.ACKNOWLEDGE),
                 timeout=60
             )
             if not response:
                 logger.warning("No response from %s", self.contragent)
                 break
 
-            try:
-                content_dict = json.loads(response.content)
-                if "ingredients" in content_dict:
-                    competitor_msg = ShopList.model_validate_json(response.content)
-                    msg_type = "ShopList"
-                elif "offer" in content_dict:
-                    competitor_msg = Conversate.model_validate_json(response.content)
-                    msg_type = "Conversate"
-                else:
-                    logger.error("Unrecognized message format from %s: %s", self.contragent, response.content)
-                    break
-            except json.JSONDecodeError:
-                logger.error("Invalid JSON format from %s: %s", self.contragent, response.content)
+            # попытка распарсить ответ
+            cleaned = self.clean_json(response.content)
+            data = self.safe_json_load(cleaned)
+
+            if not data:
+                logger.error("Empty or invalid response JSON from %s: %s", self.contragent, response.content)
                 break
 
+            competitor_msg = None
+            if "ingredients" in data:
+                competitor_msg = ShopList.model_validate(data)
+                msg_type = "ShopList"
+            elif "offer" in data:
+                competitor_msg = Conversate.model_validate(data)
+                msg_type = "Conversate"
+            elif "action" in data:
+                act_data = data["action"]
+                if "ingredients" in act_data:
+                    competitor_msg = ShopList.model_validate(act_data)
+                    msg_type = "ShopList"
+                elif "offer" in act_data:
+                    competitor_msg = Conversate.model_validate(act_data)
+                    msg_type = "Conversate"
+
+            if competitor_msg is None:
+                logger.error("Unrecognized message from %s: %s", self.contragent, data)
+                break
+
+            #print("++++ INCOMING RESPONSE INITIATOR ++++\n", competitor_msg)
             self._update_history("Opponent", competitor_msg)
+            print('===== COMPETITOR MESSAGE\n',competitor_msg)
+            # если получили ShopList — контрагент согласен
             if isinstance(competitor_msg, ShopList):
-                combined_ingredients = dict(self.agent.shop_sku)
-                overlaps = set(combined_ingredients.keys()) & set(competitor_msg.ingredients.keys())
-                for overlap in overlaps:
-                    combined_ingredients[overlap] = min(combined_ingredients[overlap],
-                                                        competitor_msg.ingredients[overlap])
-                combined_ingredients.update(
-                    {k: v for k, v in competitor_msg.ingredients.items() if k not in self.agent.shop_sku}
-                )
+                combined = dict(self.agent.shop_sku)
+                overlaps = set(combined.keys()) & set(competitor_msg.ingredients.keys())
+                for k in overlaps:
+                    combined[k] = min(combined[k], competitor_msg.ingredients[k])
+                combined.update({k: v for k, v in competitor_msg.ingredients.items()
+                                 if k not in self.agent.shop_sku})
+
                 self.agent.collaborators = sorted([self.context.agent_type, self.contragent])
                 self.agent.current_bid = AuctionProposal(
                     authors=self.agent.collaborators,
-                    prop=ShopList(ingredients=combined_ingredients)
+                    prop=ShopList(ingredients=combined)
                 )
                 break
+
+            # если получили Conversate — продолжаем торг
             elif isinstance(competitor_msg, Conversate):
                 act = await self.process_response({
                     "type": msg_type,
-                    "data": competitor_msg.model_dump()
+                    "data": competitor_msg.model_dump(),
                 })
                 self._update_history("Self", act.action)
                 current_offer = act.action
+                print('MY MESSAGE   ', current_offer)
                 if isinstance(act.action, ShopList):
                     await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
-                    # Не комбинируем здесь, ждем ответа от opponent
-                    # Break убран, чтобы продолжить цикл и получить ответ
                 elif isinstance(act.action, Conversate):
                     await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
                 else:
                     logger.warning("Unexpected action type: %s", type(act.action))
                     break
+
             iteration += 1
 
         await thread.close()
@@ -603,14 +684,84 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         self.conversation_history = []
         self.merchant_prompt = DIALOGUE_RESPONDER_PROMPT
 
+    # -----------------------
+    # JSON УТИЛИТЫ
+    # -----------------------
+    def clean_json(self, text: str) -> str:
+        """Удаляет markdown-блоки и лишние символы."""
+        text = text.strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        # Иногда LLM вставляет лишние запятые или \n перед JSON
+        start_idx = text.find("{")
+        end_idx = text.rfind("}")
+        if start_idx != -1 and end_idx != -1:
+            text = text[start_idx:end_idx + 1]
+        return text.strip()
+
+    def safe_json_load(self, text: str) -> dict:
+        """Пытается корректно загрузить JSON с несколькими попытками исправления."""
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Попробуем подрезать строку до последней закрывающей фигурной скобки
+            trimmed = text.split("}")[:-1]
+            for i in range(len(trimmed), 0, -1):
+                try_text = "}".join(trimmed[:i]) + "}"
+                try:
+                    return json.loads(try_text)
+                except json.JSONDecodeError:
+                    continue
+        return {}
+
+    def fix_act_json(self, data: dict) -> dict:
+        """Исправляет структуру Act JSON при некорректных вложениях."""
+        if not isinstance(data, dict):
+            return {"action": {"offer": str(data)}}
+
+        action = data.get("action")
+
+        # Если LLM не добавил ключ action, пытаемся распознать вручную
+        if action is None:
+            if "offer" in data:
+                data = {"action": {"offer": data["offer"]}}
+            elif "ingredients" in data:
+                data = {"action": {"ingredients": data["ingredients"]}}
+            else:
+                data = {"action": {"offer": str(data)}}
+            return data
+
+        # Если action строка — это Conversate
+        if isinstance(action, str):
+            return {"action": {"offer": action}}
+
+        # Если action — словарь ингредиентов
+        if isinstance(action, dict):
+            if "ingredients" in action:
+                return {"action": {"ingredients": action["ingredients"]}}
+            elif "offer" in action:
+                return {"action": {"offer": action["offer"]}}
+            elif all(isinstance(v, (int, float)) for v in action.values()):
+                return {"action": {"ingredients": action}}
+            elif all(isinstance(v, str) for v in action.values()):
+                return {"action": {"offer": " ".join(action.values())}}
+
+        # fallback
+        return {"action": {"offer": str(action)}}
+
+    # -----------------------
+    # ИСТОРИЯ
+    # -----------------------
     def _update_history(self, role: str, content: str):
-        """Update conversation history with new message"""
+        """Добавляет в историю реплику."""
         self.conversation_history.append(f"{role}: {content}")
-        if len(self.conversation_history) > 5:
+        if len(self.conversation_history) > 10:
             self.conversation_history.pop(0)
 
+    # -----------------------
+    # ГЛАВНАЯ ЛОГИКА
+    # -----------------------
     async def process_interaction(self, interaction_data: dict) -> Act:
-        """Process incoming interaction and generate a response"""
+        """Обрабатывает запрос и получает ответ от модели."""
         chain = self.merchant_prompt | self.model
         answer = await chain.ainvoke({
             "conversation_history": "\n".join(self.conversation_history),
@@ -619,57 +770,79 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             "current_interaction_data": str(interaction_data["data"]),
             "format_instructions": self.parser.get_format_instructions(),
         })
-        return self.parser.parse(answer.content)
+
+        # print("==== RAW LLM RESPONSE ====")
+        # print(answer.content)
+
+        cleaned = self.clean_json(answer.content)
+        data = self.safe_json_load(cleaned)
+        fixed = self.fix_act_json(data)
+
+        try:
+            return self.parser.parse(json.dumps(fixed))
+        except Exception as e:
+            logger.error("Error parsing Act: %s\nRecovered JSON: %s", e, fixed)
+            return Act(action=Conversate(offer="Извините, я не смог корректно ответить."))
 
     async def step(self):
-        """Handle incoming dialogue request"""
-
-        def clean_json(text: str) -> str:
-            text = text.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.endswith("```"):
-                text = text[:-3]
-            return text.strip()
-
-        cleaned_content = clean_json(self.message.content)
-
-        # Сначала проверяем структуру JSON
+        """Обработка входящего сообщения диалога."""
+        raw_content = self.message.content.strip()
+        cleaned = self.clean_json(raw_content)
+        # print("RAW MSG TO RESPONDER\n", raw_content)
+        # Разбор входящего JSON
         try:
-            import json
-            data = json.loads(cleaned_content)
-
-            # Если есть поле 'offer' - это Conversate
-            if 'offer' in data:
-                current_interaction = Conversate.model_validate(data)
-            # Если есть поле 'ingredients' - это ShopList
-            elif 'ingredients' in data:
-                current_interaction = ShopList.model_validate(data)
-            else:
-                # Если нет ожидаемых полей - ошибка
-                await self.context.reply_with_refuse(self.message).with_content(
-                    "Invalid request format: missing required fields")
-                return
-
+            data = json.loads(cleaned)
         except json.JSONDecodeError:
-            pass
+            await self.context.reply_with_refuse(self.message).with_content("Некорректный формат JSON")
+            return
+
+        # Определяем тип взаимодействия
+        current_interaction = None
+        if "offer" in data:
+            current_interaction = Conversate.model_validate(data)
+        elif "ingredients" in data:
+            current_interaction = ShopList.model_validate(data)
+        elif "action" in data:
+            # LLM мог обернуть действием
+            action_data = data["action"]
+            if "offer" in action_data:
+                current_interaction = Conversate.model_validate(action_data)
+            elif "ingredients" in action_data:
+                current_interaction = ShopList.model_validate(action_data)
+        else:
+            await self.context.reply_with_refuse(self.message).with_content(
+                "Invalid request format: missing required fields")
+            return
+
+        # print("++++ INCOMING INTERACTION ++++\n", current_interaction)
 
         self._update_history("Opponent", str(current_interaction))
-        act = await self.process_interaction(
-            {"type": type(current_interaction).__name__, "data": current_interaction.model_dump()}
-        )
-        self._update_history("Self", str(act.action))
 
+        act = await self.process_interaction({
+            "type": type(current_interaction).__name__,
+            "data": current_interaction.model_dump(),
+        })
+
+        self._update_history("Self", str(act.action))
+        # print("---- RESPONSE ACT ----\n", act.action)
+
+        # Отправка корректного ответа
         if isinstance(act.action, ShopList):
-            await self.context.reply_with_acknowledge(self.message).with_content(act.action.model_dump_json())
+            await self.context.reply_with_acknowledge(self.message).with_content(
+                act.action.model_dump_json()
+            )
             self.agent.current_bid = AuctionProposal(
                 authors=[self.context.agent_type],
                 prop=act.action
             )
         elif isinstance(act.action, Conversate):
-            await self.context.reply_with_acknowledge(self.message).with_content(act.action.model_dump_json())
+            await self.context.reply_with_acknowledge(self.message).with_content(
+                act.action.model_dump_json()
+            )
         else:
-            await self.context.reply_with_refuse(self.message).with_content("Unexpected action type")
+            await self.context.reply_with_refuse(self.message).with_content(
+                "Unexpected action type"
+            )
 
 
 class AuctionBidderBehaviour(MessageHandlingBehavior):
@@ -682,6 +855,69 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         self.decision_parser = PydanticOutputParser(pydantic_object=Decision)
         self.shoplist_parser = PydanticOutputParser(pydantic_object=ShopList)
         self.merchant_prompt = AUCTION_BIDDER_PROMPT
+
+    def clean_json(self, text: str) -> str:
+        """Clean the JSON string by removing markdown code blocks and extra text."""
+        text = text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[: -3]
+        return text.strip()
+
+    def safe_json_loads(self, text: str) -> Optional[dict]:
+        """
+        Безопасно парсит JSON-ответ от LLM.
+        Поддерживает частично повреждённые или вложенные структуры.
+        Возвращает dict или None.
+        """
+        text = self.clean_json(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            import re
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except Exception:
+                    pass
+            logger.error("safe_json_loads(): не удалось распарсить JSON\n%s", text)
+            return None
+
+    def normalize_llm_output(self, data: Optional[dict]) -> dict:
+        """
+        Приводит любые варианты ответов LLM к единому виду:
+        - Если это сразу ShopList — оборачиваем.
+        - Если это CollaborationProposal — оставляем.
+        - Если LLM вложил структуру в лишние уровни ("decision", "CollaborationProposal" и т.п.) — разворачиваем.
+        """
+        if not data:
+            return {"decision": {"ingredients": {}}}
+
+        if "decision" in data:
+            dec = data["decision"]
+        else:
+            dec = data
+
+        if isinstance(dec, dict) and "ingredients" in dec:
+            return {"decision": dec}
+
+        if isinstance(dec, dict) and "target_agent" in dec and "needed_ingredients" in dec:
+            needed = dec["needed_ingredients"]
+            if isinstance(needed, dict) and "ingredients" not in needed:
+                needed = {"ingredients": needed}
+            return {"decision": {"target_agent": dec["target_agent"], "needed_ingredients": needed}}
+
+        for k, v in dec.items() if isinstance(dec, dict) else []:
+            if isinstance(v, dict):
+                if "ingredients" in v or ("target_agent" in v and "needed_ingredients" in v):
+                    return {"decision": v}
+
+        if all(isinstance(k, str) for k in dec.keys()) and all(isinstance(v, (int, float)) for v in dec.values()):
+            return {"decision": {"ingredients": dec}}
+
+        return {"decision": {"ingredients": {}}}
 
     async def get_current_board(self) -> ProposalBoard:
         """Retrieve the current state of the proposal board"""
@@ -697,9 +933,6 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         """Update the agent's current bid based on the board state"""
         current_board = await self.get_current_board()
         if self.context.agent_type not in current_board.agents:
-            # Если агент участвует в текущей лидирующей ставке, то ему нет смысла изменять ставку.
-            # В противоположном случае пытаемся улучшить ставку
-
             agents_able = ["second_merchant"] if self.context.agent_type == 'first_merchant' else ["first_merchant"]
             chain = self.merchant_prompt | self.model
             await asyncio.sleep(self.config.bid_delay)
@@ -709,10 +942,14 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
                 "format_instructions": self.decision_parser.get_format_instructions(),
                 "agents_able_to_conversate": agents_able
             })
+
+            # print('000000 НАЧАЛО \n', answer.content)
             try:
-                response = self.decision_parser.parse(answer.content).decision
+                raw_data = self.safe_json_loads(answer.content)
+                normalized = self.normalize_llm_output(raw_data)
+                response = self.decision_parser.parse(json.dumps(normalized)).decision
             except Exception as e:
-                logger.error("Error parsing decision: %s", e)
+                logger.error("Ошибка при обработке ответа LLM: %s", e)
                 response = ShopList(ingredients={})
 
             if isinstance(response, ShopList):
@@ -722,12 +959,14 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
                 )
             elif isinstance(response, CollaborationProposal):
                 contragent = response.target_agent
+                print("DIALOGUE STARTED WITH CONTRAGENT",contragent)
                 needed = response.needed_ingredients
                 start_conversation = StartDialogueBehaviour(
                     self.context, self.config, contragent, needed, self.model
                 )
                 self.agent.add_behaviour(start_conversation)
                 await start_conversation.join()
+                print("DIALOGUE FINISHED",contragent)
                 if self.agent.current_bid is None:
                     chain = self.merchant_prompt | self.model
                     await asyncio.sleep(self.config.bid_delay)
@@ -738,7 +977,9 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
                         "agents_able_to_conversate": agents_able,
                         "self_type": self.context.agent_type
                     })
-                    fallback_prop = self.shoplist_parser.parse(fallback_answer.content)
+                    fallback_data = self.safe_json_loads(fallback_answer.content)
+                    normalized_fallback = self.normalize_llm_output(fallback_data)
+                    fallback_prop = self.shoplist_parser.parse(json.dumps(normalized_fallback))
                     self.agent.current_bid = AuctionProposal(
                         authors=[self.context.agent_type],
                         prop=fallback_prop
