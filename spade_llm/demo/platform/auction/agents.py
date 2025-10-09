@@ -831,10 +831,6 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             await self.context.reply_with_acknowledge(self.message).with_content(
                 act.action.model_dump_json()
             )
-            self.agent.current_bid = AuctionProposal(
-                authors=[self.context.agent_type],
-                prop=act.action
-            )
         elif isinstance(act.action, Conversate):
             await self.context.reply_with_acknowledge(self.message).with_content(
                 act.action.model_dump_json()

@@ -27,7 +27,7 @@ DIALOGUE_INITIATOR_PROMPT = ChatPromptTemplate.from_template(
 Данные: {current_interaction_data}
 
 Решение:
-1. Если после 1–2 сообщений торга ответ контрагента позволяет сформировать совместную ставку с ценой, дающей тебе прибыль на 20% выше базовой, прими его, вернув ShopList с согласованными товарами и ценами. 
+1. Если после 1–2 сообщений торга ответ контрагента позволяет сформировать совместную ставку прими его, вернув ShopList с согласованными товарами и ценами. 
 2. В остальных случаях (включая начало диалога) верни Conversate — краткий, убедительный запрос или корректировку, объясняя выгоду сделки и предлагая торг в одно-два предложения.
 
 Respond in json format
@@ -35,8 +35,8 @@ Respond in json format
 JSON only, without Markdown and additional text. 
 БЕЗ Markdown!!! 
 НЕ добавляй лишние уровни вроде {{"action": {{"Conversate": {{...}}}}}}. 
-Если Conversate: {{"action": {{"offer": "Твое аргументированное сообщение "}}}} 
-Если ShopList: {{"action": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}}
+Для вывода Conversate: {{"action": {{"offer": "Твое аргументированное сообщение "}}}} 
+Для вывода ShopList: {{"action": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}}
 """
 )
 
@@ -51,7 +51,7 @@ DIALOGUE_RESPONDER_PROMPT = ChatPromptTemplate.from_template(
 - Не используй длинные торги. Максимум 2 сообщения Conversate за весь диалог. 
 - Длинные переговоры снижают прибыль — цель: договориться быстро и с выгодой. 
 - Если цена >= твоей базовой +20%, просто соглашайся и формируй ShopList. 
-- Если низкая — один раз верни краткое Conversate с контрпредложением (одна фраза). 
+- Если низкая — один раз верни краткое Conversate с контрпредложением (одна фраза текстом). 
 
 Фокус:
 - Действуй коротко, конкретно и профессионально. 
@@ -65,15 +65,15 @@ DIALOGUE_RESPONDER_PROMPT = ChatPromptTemplate.from_template(
 
 Решение:
 1. Если после короткого торга или сразу запрос выгоден (цены дают +20% прибыли к базовой), прими его, вернув ShopList. 
-2. В остальных случаях верни Conversate — краткое контрпредложение (1–2 предложения максимум). 
+2. В остальных случаях верни Conversate — краткое текстовое контрпредложение (возможно с акцентом на цены) (1–2 предложения максимум). 
 
 Respond in json format
 {format_instructions}.
 JSON only, without Markdown and additional text. 
 БЕЗ Markdown!!! 
 НЕ добавляй лишние уровни вроде {{"action": {{"Conversate": {{...}}}}}}. 
-Если Conversate: {{"action": {{"offer": "Аргументированное сообщение от тебя"}}}} 
-Если ShopList: {{"action": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}}
+Для вывода Conversate: {{"action": {{"offer": "Аргументированное сообщение от тебя"}}}} 
+Для вывода ShopList: {{"action": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}}
 """
 )
 
@@ -109,7 +109,7 @@ Respond in json format
 JSON only, without Markdown and additional text. 
 БЕЗ Markdown!!! 
 НЕ добавляй лишние уровни вроде {{"decision": {{"CollaborationProposal": {{...}}}}}}. 
-Если ShopList: {{"decision": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}} 
-Если CollaborationProposal: {{"decision": {{"target_agent": "имя_агента", "needed_ingredients": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}}}}
+Для вывода ShopList: {{"decision": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}} 
+Для вывода CollaborationProposal: {{"decision": {{"target_agent": "имя_агента", "needed_ingredients": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}}}}
 """
 )
