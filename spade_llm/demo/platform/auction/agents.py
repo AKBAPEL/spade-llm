@@ -57,7 +57,7 @@ class ProposalBoard(BaseModel):
 
 
 class ProposalBoardAgentConf(BaseModel):
-    total_rounds: int = Field(default=6, description="Общее количество раундов аукциона")
+    total_rounds: int = Field(default=3, description="Общее количество раундов аукциона")
     stable_limit: int = Field(default=3, description="Сколько раундов подряд должна держаться ставка для завершения")
 
 
@@ -80,7 +80,9 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
 
         async def step(self) -> None:
             """Run the auction process for the requested ingredients"""
-            self.agent.proposal_board.sku_request = ShopListRequest(ingredients=self.ingredients)
+            self.agent.proposal_board = ProposalBoard(agents=[],
+                                                      proposal=ShopList(),
+                                                      sku_request=ShopListRequest(ingredients=self.ingredients))
             await asyncio.sleep(1)
 
             stable_rounds = 0
@@ -137,7 +139,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                     f"Не удалось собрать все ингредиенты. Отсутствуют: {', '.join(missing_ingredients)}"
                 )
 
-            self.set_is_done()
+            # self.set_is_done()
 
     class RequestInfoBehaviour(MessageHandlingBehavior):
         def __init__(self, config: ProposalBoardAgentConf):
