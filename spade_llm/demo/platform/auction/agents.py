@@ -536,11 +536,21 @@ class StartDialogueBehaviour(ContextBehaviour):
             return "Unknown", content
 
         with open(path, "w", encoding="utf-8") as f:
+            f.write(f"=== Dialogue log started at {timestamp} ===\n")
+            f.write(f"Initiator agent: {self.context.agent_type}\n")
+            f.write(f"Contragent agent: {self.contragent}\n")
+            f.write("=========================================\n\n")
             for entry in self.conversation_history:
                 try:
                     role, content = entry.split(": ", 1)
                     msg_type, display = parse_saved(content)
-                    f.write(f"{role} ({msg_type}): {display}\n")
+                    # определяем тип агента
+                    if role.lower() == "self":
+                        agent_type = self.context.agent_type
+                    else:
+                        agent_type = self.contragent
+
+                    f.write(f"{role} [{agent_type}] ({msg_type}): {display}\n")
                 except Exception:
                     f.write(f"ParseError: {entry}\n")
 
