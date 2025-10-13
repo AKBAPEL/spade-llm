@@ -570,8 +570,8 @@ class StartDialogueBehaviour(ContextBehaviour):
             "format_instructions": self.parser.get_format_instructions(),
         })
 
-        #print("==== RAW LLM RESPONSE INITIATOR ====")
-        #print(answer.content)
+        # print("==== RAW LLM RESPONSE INITIATOR ====")
+        # print(answer.content)
 
         cleaned = self.clean_json(answer.content)
         data = self.safe_json_load(cleaned)
@@ -640,9 +640,9 @@ class StartDialogueBehaviour(ContextBehaviour):
                 logger.error("Unrecognized message from %s: %s", self.contragent, data)
                 break
 
-            #print("++++ INCOMING RESPONSE INITIATOR ++++\n", competitor_msg)
+            # print("++++ INCOMING RESPONSE INITIATOR ++++\n", competitor_msg)
             self._update_history("Opponent", competitor_msg)
-            print('===== COMPETITOR MESSAGE\n',competitor_msg)
+            # print('===== COMPETITOR MESSAGE\n', competitor_msg)
             # если получили ShopList — контрагент согласен
             if isinstance(competitor_msg, ShopList):
                 combined = dict(self.agent.shop_sku)
@@ -667,7 +667,7 @@ class StartDialogueBehaviour(ContextBehaviour):
                 })
                 self._update_history("Self", act.action)
                 current_offer = act.action
-                print('MY MESSAGE   ', current_offer)
+                # print('MY MESSAGE   ', current_offer)
                 if isinstance(act.action, ShopList):
                     await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
                 elif isinstance(act.action, Conversate):
@@ -691,7 +691,7 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         self.config = config
         self.model = model
         self.parser = PydanticOutputParser(pydantic_object=Act)
-        self.conversation_history = []
+        self.conversation_history = dict()
         self.merchant_prompt = DIALOGUE_RESPONDER_PROMPT
 
     # -----------------------
@@ -761,20 +761,20 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
     # -----------------------
     # ИСТОРИЯ
     # -----------------------
-    def _update_history(self, role: str, content: str):
+    def _update_history(self, role: str, content: str, conversation_id):
         """Добавляет в историю реплику."""
-        self.conversation_history.append(f"{role}: {content}")
-        if len(self.conversation_history) > 10:
-            self.conversation_history.pop(0)
+        self.conversation_history[conversation_id].append(f"{role}: {content}")
+        if len(self.conversation_history[conversation_id]) > 10:
+            self.conversation_history[conversation_id].pop(0)
 
     # -----------------------
     # ГЛАВНАЯ ЛОГИКА
     # -----------------------
-    async def process_interaction(self, interaction_data: dict) -> Act:
+    async def process_interaction(self, interaction_data: dict, conversation_id) -> Act:
         """Обрабатывает запрос и получает ответ от модели."""
         chain = self.merchant_prompt | self.model
         answer = await chain.ainvoke({
-            "conversation_history": "\n".join(self.conversation_history),
+            "conversation_history": "\n".join(self.conversation_history[conversation_id]),
             "shop_sku": self.agent.shop_sku,
             "current_interaction_type": interaction_data["type"],
             "current_interaction_data": str(interaction_data["data"]),
@@ -787,7 +787,6 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         cleaned = self.clean_json(answer.content)
         data = self.safe_json_load(cleaned)
         fixed = self.fix_act_json(data)
-
         try:
             return self.parser.parse(json.dumps(fixed))
         except Exception as e:
@@ -797,8 +796,15 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
     async def step(self):
         """Обработка входящего сообщения диалога."""
         raw_content = self.message.content.strip()
+        conversation_id = self.message.thread_id
+        if conversation_id not in self.conversation_history.keys():
+            self.conversation_history[conversation_id] = list()
+
+        # print('\n\n\n  ++  initiator is', self.message.sender, '\n\n\n------------',
+        #       len(self.conversation_history[conversation_id]), '------',
+        #       self.message.thread_id)
+
         cleaned = self.clean_json(raw_content)
-        # print("RAW MSG TO RESPONDER\n", raw_content)
         # Разбор входящего JSON
         try:
             data = json.loads(cleaned)
@@ -826,14 +832,14 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
 
         # print("++++ INCOMING INTERACTION ++++\n", current_interaction)
 
-        self._update_history("Opponent", str(current_interaction))
-
-        act = await self.process_interaction({
-            "type": type(current_interaction).__name__,
-            "data": current_interaction.model_dump(),
-        })
-
-        self._update_history("Self", str(act.action))
+        self._update_history("Opponent", str(current_interaction), conversation_id)
+        act = await self.process_interaction(
+            {
+                "type": type(current_interaction).__name__,
+                "data": current_interaction.model_dump(),
+            },
+            conversation_id)
+        self._update_history("Self", str(act.action), conversation_id)
         # print("---- RESPONSE ACT ----\n", act.action)
 
         # Отправка корректного ответа
@@ -939,7 +945,7 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         """Update the agent's current bid based on the board state"""
         current_board = await self.get_current_board()
         if self.context.agent_type not in current_board.agents:
-            agents_able = ["second_merchant"] if self.context.agent_type == 'first_merchant' else ["first_merchant"]
+            agents_able = [a for a in ["first_merchant", "second_merchant"] if a != self.context.agent_type]
             chain = self.merchant_prompt | self.model
             await asyncio.sleep(self.config.bid_delay)
             answer = await chain.ainvoke({
@@ -965,14 +971,14 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
                 )
             elif isinstance(response, CollaborationProposal):
                 contragent = response.target_agent
-                print("DIALOGUE STARTED WITH CONTRAGENT",contragent)
+                print("DIALOGUE STARTED WITH CONTRAGENT", contragent)
                 needed = response.needed_ingredients
                 start_conversation = StartDialogueBehaviour(
                     self.context, self.config, contragent, needed, self.model
                 )
                 self.agent.add_behaviour(start_conversation)
                 await start_conversation.join()
-                print("DIALOGUE FINISHED",contragent)
+                print("DIALOGUE FINISHED WITH CONTRAGENT", contragent)
                 if self.agent.current_bid is None:
                     chain = self.merchant_prompt | self.model
                     await asyncio.sleep(self.config.bid_delay)
