@@ -26,6 +26,10 @@ agents:
     type_name: spade_llm.demo.platform.auction.agents.SecondMerchantAgent
     args:
       model: max
+  third_merchant:
+    type_name: spade_llm.demo.platform.auction.agents.ThirdMerchantAgent
+    args:
+      model: max
   # Console agent which listens for commands from console and sends them to the delegate agent
   console:
     type_name: spade_llm.agents.console.ConsoleAgent

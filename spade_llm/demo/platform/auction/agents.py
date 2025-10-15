@@ -283,7 +283,69 @@ class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
             ]
         )
 
+class ThirdMerchantAgentConf(BaseModel):
+    model: str = Field(description="Model name")
+    bid_delay: float = Field(default=2, description="Delay between bids")
 
+
+@configuration(ThirdMerchantAgentConf)
+class ThirdMerchantAgent(Agent, Configurable[ThirdMerchantAgentConf]):
+    """Agent representing the 3 merchant in the auction"""
+    shop_sku = {
+        #"мясо (говядина)": 550,
+        "морковь": 30,
+        "лук репчатый": 20,
+        "капуста белокочанная": 80,
+        "картофель": 40,
+        "свёкла": 10,
+        "уксус (лимонный сок)": 90,
+        "томатная паста": 35,
+        "чеснок": 15,
+        "лавровый лист": 5,
+        "соль, перец": 10,
+        "зелень (укроп/петрушка)": 25,
+        "сметана": 60
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.current_bid: Optional[AuctionProposal] = None
+        self.collaborators: Optional[List[str]] = None
+
+    def setup(self):
+        """Initialize agent with auction and dialogue behaviors"""
+        asyncio.create_task(self.register_in_df())
+        self.add_behaviour(AuctionBidderBehaviour(
+            config=self.config,
+            model=self.default_context.create_chat_model(self.config.model)
+        ))
+        self.add_behaviour(DialogueResponderBehaviour(
+            config=self.config,
+            model=self.default_context.create_chat_model(self.config.model)
+        ))
+
+    async def register_in_df(self):
+        """Register the agent in the directory facilitator"""
+        context = self.default_context
+        await asyncio.sleep(3)
+        await context.inform(DF_ADDRESS).with_content(self.create_description())
+
+    def create_description(self) -> AgentDescription:
+        """Create a description for the agent"""
+        return AgentDescription(
+            id="third_merchant",
+            description="""Агент-магазин который участвует в аукционе""",
+            tasks=[
+                AgentTask(
+                    description="Получение текущего состояния аукциона и запрос на предложение",
+                    examples=[
+                        """
+                        class ShopListRequest(BaseModel):
+                            ingredients: List[str] = Field(description="List of ingredients needed")"""
+                    ]
+                )
+            ]
+        )
 class AuctionProposal(BaseModel):
     authors: List[str] = Field(description="Names of the agents who proposed", default_factory=list)
     prop: ShopList = Field(description="proposal_shoplist")
