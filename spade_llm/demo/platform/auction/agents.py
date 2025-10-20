@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import json
+import os, json
+from datetime import datetime
 from typing import Dict, List, Optional, Set, Union
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -54,6 +56,8 @@ class ProposalBoard(BaseModel):
     sku_request: ShopListRequest = Field(description="User sku`s request")
     round_number: int = Field(default=0, description="Текущий номер раунда аукциона")
     total_rounds: int = Field(default=0, description="Всего раундов аукциона")
+    bid_ingredient_split: Dict[str, Dict[str, int]] = Field(default={},
+                                                            description="Указывает на разделение ингредиентов для ставки между агентами")
 
 
 class ProposalBoardAgentConf(BaseModel):
@@ -65,6 +69,24 @@ class ProposalBoardAgentConf(BaseModel):
 class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
     """Agent managing the auction proposal board"""
     proposal_board = ProposalBoard(agents=[], proposal=ShopList(), sku_request=ShopListRequest())
+
+    def _save_winning_bid_split(self):
+        """Save the bid_ingredient_split of the winning proposal to a file in dialogue-like format"""
+        os.makedirs("auction_logs", exist_ok=True)
+        timestamp = datetime.now().strftime("%d-%H-%M-%S-%f")
+        filename = f"winning_bid_split_{timestamp}.txt"
+        path = os.path.join("auction_logs", filename)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"=== Winning bid split log started at {timestamp} ===\n")
+            f.write(f"Winning agents: {', '.join(self.proposal_board.agents)}\n")
+            f.write("=========================================\n\n")
+            for agent, ingredients in self.proposal_board.bid_ingredient_split.items():
+                f.write(f"Agent [{agent}] (Ingredients):\n")
+                f.write(json.dumps(ingredients, ensure_ascii=False, indent=2) + "\n")
+            f.write("=========================================\n")
+
+        logger.info("Saved winning bid_ingredient_split to %s", path)
 
     class InitialRequestBehaviour(MessageHandlingBehavior):
         ingredients = [
@@ -134,6 +156,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 await self.context.reply_with_inform(self.message).with_content(
                     f"Все ингредиенты найдены. Общая цена: {total_price}"
                 )
+                self.agent._save_winning_bid_split()
             else:
                 await self.context.reply_with_inform(self.message).with_content(
                     f"Не удалось собрать все ингредиенты. Отсутствуют: {', '.join(missing_ingredients)}"
@@ -177,7 +200,8 @@ class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
         "уксус (лимонный сок)": 10,
         "лавровый лист": 5,
         "соль, перец": 10,
-        "зелень (укроп/петрушка)": 30
+        "зелень (укроп/петрушка)": 30,
+        #"сметана" : 60
     }
 
     def __init__(self, *args, **kwargs):
@@ -283,6 +307,7 @@ class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
             ]
         )
 
+
 class ThirdMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
     bid_delay: float = Field(default=2, description="Delay between bids")
@@ -292,7 +317,7 @@ class ThirdMerchantAgentConf(BaseModel):
 class ThirdMerchantAgent(Agent, Configurable[ThirdMerchantAgentConf]):
     """Agent representing the 3 merchant in the auction"""
     shop_sku = {
-        #"мясо (говядина)": 550,
+        # "мясо (говядина)": 550,
         "морковь": 30,
         "лук репчатый": 20,
         "капуста белокочанная": 80,
@@ -346,9 +371,13 @@ class ThirdMerchantAgent(Agent, Configurable[ThirdMerchantAgentConf]):
                 )
             ]
         )
+
+
 class AuctionProposal(BaseModel):
     authors: List[str] = Field(description="Names of the agents who proposed", default_factory=list)
     prop: ShopList = Field(description="proposal_shoplist")
+    bid_ingredient_split: Dict[str, Dict[str, int]] = Field(default={},
+                                                            description="Указывает на разделение ингредиентов для ставки между агентами")
 
 
 class AuctionContractNetInitiatorBehavior(ContextBehaviour):
@@ -448,6 +477,7 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
                     winner_sender = sender
                     self.agent.proposal_board.proposal = winner.prop
                     self.agent.proposal_board.agents = winner.authors
+                    self.agent.proposal_board.bid_ingredient_split = winner.bid_ingredient_split
                     await self.context.accept(sender).with_content('')
                 else:
                     logger.info("Not better, rejecting")
@@ -497,7 +527,7 @@ class StartDialogueBehaviour(ContextBehaviour):
     """Behavior for initiating a dialogue with another merchant"""
 
     def __init__(self, context: AgentContext, config, contragent: str,
-                 needed_ingredients: ShopList, model: BaseChatModel):
+                 needed_ingredients: ShopList, model: BaseChatModel, user_request: ShopListRequest):
         super().__init__(context)
         self.config = config
         self.contragent = contragent
@@ -508,6 +538,7 @@ class StartDialogueBehaviour(ContextBehaviour):
         self.shoplist_parser = PydanticOutputParser(pydantic_object=ShopList)
         self.conversate_parser = PydanticOutputParser(pydantic_object=Conversate)
         self.merchant_prompt = DIALOGUE_INITIATOR_PROMPT
+        self.user_request = user_request
 
     # -----------------------
     # JSON УТИЛИТЫ
@@ -581,8 +612,6 @@ class StartDialogueBehaviour(ContextBehaviour):
 
     def _save_dialogue(self):
         """Сохраняет историю диалога в файл"""
-        import os, json
-        from datetime import datetime
         os.makedirs("dialogues", exist_ok=True)
         timestamp = datetime.now().strftime("%d-%H-%M-%S-%f")
         filename = f"dialogue_start_{timestamp}.txt"
@@ -709,17 +738,36 @@ class StartDialogueBehaviour(ContextBehaviour):
             # print('===== COMPETITOR MESSAGE\n', competitor_msg)
             # если получили ShopList — контрагент согласен
             if isinstance(competitor_msg, ShopList):
-                combined = dict(self.agent.shop_sku)
-                overlaps = set(combined.keys()) & set(competitor_msg.ingredients.keys())
-                for k in overlaps:
-                    combined[k] = min(combined[k], competitor_msg.ingredients[k])
-                combined.update({k: v for k, v in competitor_msg.ingredients.items()
-                                 if k not in self.agent.shop_sku})
+
+                # Создаем комбинированную ставку с ингредиентами обоих агентов
+                combined = {}
+                # Добавляем ингредиенты текущего агента (инициатора)
+                for item, price in self.agent.shop_sku.items():
+                    if item in self.user_request.ingredients:
+                        combined[item] = price
+                # print('\n' * 3, '===================ONLY FIRST ', combined)
+                first_agents_part = combined.copy()
+                second_agents_part = {}
+                # Применяем ингредиенты конкурента.
+                extras = {}  # ингредиенты которые контрагент дал сверх запроса пользователя
+                for item, price in competitor_msg.ingredients.items():
+                    if item in self.user_request.ingredients:
+                        combined[item] = price
+                        second_agents_part[item] = price
+                        if item in first_agents_part.keys():
+                            first_agents_part.pop(
+                                item)  # убираем из части первого агента ингредиенты которые поставляет второй
+                    else:
+                        extras[item] = price
+                if extras:
+                    print('\n' * 3, '=================== АГЕНТ ДАЛ СВЕРХ ЗАПРОСА', extras)
 
                 self.agent.collaborators = sorted([self.context.agent_type, self.contragent])
                 self.agent.current_bid = AuctionProposal(
                     authors=self.agent.collaborators,
-                    prop=ShopList(ingredients=combined)
+                    prop=ShopList(ingredients=combined),
+                    bid_ingredient_split={self.context.agent_type: first_agents_part,
+                                          self.contragent: second_agents_part}
                 )
                 break
 
@@ -1031,14 +1079,15 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
             if isinstance(response, ShopList):
                 self.agent.current_bid = AuctionProposal(
                     authors=[self.context.agent_type],
-                    prop=response
+                    prop=response,
+                    bid_ingredient_split={self.context.agent_type: response.ingredients}
                 )
             elif isinstance(response, CollaborationProposal):
                 contragent = response.target_agent
                 print("DIALOGUE STARTED WITH CONTRAGENT", contragent)
                 needed = response.needed_ingredients
                 start_conversation = StartDialogueBehaviour(
-                    self.context, self.config, contragent, needed, self.model
+                    self.context, self.config, contragent, needed, self.model, current_board.sku_request
                 )
                 self.agent.add_behaviour(start_conversation)
                 await start_conversation.join()
@@ -1058,7 +1107,8 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
                     fallback_prop = self.shoplist_parser.parse(json.dumps(normalized_fallback))
                     self.agent.current_bid = AuctionProposal(
                         authors=[self.context.agent_type],
-                        prop=fallback_prop
+                        prop=fallback_prop,
+                        bid_ingredient_split={self.context.agent_type: fallback_prop.ingredients}
                     )
 
     async def get_my_bid(self):
@@ -1072,7 +1122,9 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         await asyncio.sleep(self.config.bid_delay)
         await self.context.reply_with_propose(self.message).with_content(my_bid)
         response = await self.receive(MessageTemplate(thread_id=self.context.thread_id), timeout=15)
-        if response.content == 'UPDATING':
+        if response is None:
+            logger.warning("No response received from %s", self.message.sender)
+        elif response.content == 'UPDATING':
             logger.info("Received UPDATING response")
         elif response.performative == consts.ACCEPT:
             pass
