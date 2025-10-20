@@ -77,6 +77,13 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
         filename = f"winning_bid_split_{timestamp}.txt"
         path = os.path.join("auction_logs", filename)
 
+        # Словарь с shop_sku для каждого агента
+        agent_shop_sku = {
+            "first_merchant": FirstMerchantAgent.shop_sku,
+            "second_merchant": SecondMerchantAgent.shop_sku,
+            "third_merchant": ThirdMerchantAgent.shop_sku
+        }
+
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"=== Winning bid split log started at {timestamp} ===\n")
             f.write(f"Winning agents: {', '.join(self.proposal_board.agents)}\n")
@@ -84,6 +91,19 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             for agent, ingredients in self.proposal_board.bid_ingredient_split.items():
                 f.write(f"Agent [{agent}] (Ingredients):\n")
                 f.write(json.dumps(ingredients, ensure_ascii=False, indent=2) + "\n")
+
+                # Подсчет суммы за ингредиенты в заказе
+                order_sum = sum(ingredients.values())
+                f.write(f"Total sum for ingredients in order: {order_sum}\n")
+
+                # Подсчет суммы за те же ингредиенты в shop_sku агента
+                shop_sum = sum(agent_shop_sku[agent].get(ingr, 0) for ingr in ingredients.keys())
+                f.write(f"Total sum for these ingredients in shop_sku: {shop_sum}\n")
+
+                # Расчет маржи в процентах
+                margin = ((order_sum - shop_sum) / shop_sum * 100) if shop_sum > 0 else 0
+                f.write(f"Margin: {margin:.2f}%\n")
+                f.write("\n")
             f.write("=========================================\n")
 
         logger.info("Saved winning bid_ingredient_split to %s", path)
@@ -201,7 +221,7 @@ class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
         "лавровый лист": 5,
         "соль, перец": 10,
         "зелень (укроп/петрушка)": 30,
-        #"сметана" : 60
+        # "сметана" : 60
     }
 
     def __init__(self, *args, **kwargs):
