@@ -356,6 +356,7 @@ class AgentContext(KeyValueStorage, ModelsProvider, MessageSender, metaclass=ABC
     @dispatch(str)
     def propose(self, receiver: str) -> MessageBuilder:
         return self.create_message_builder(consts.PROPOSE).to_agent(receiver)
+
     @dispatch(AgentId)
     def refuse(self, receiver: AgentId) -> MessageBuilder:
         return self.create_message_builder(consts.REFUSE).to_agent(receiver)
@@ -363,6 +364,7 @@ class AgentContext(KeyValueStorage, ModelsProvider, MessageSender, metaclass=ABC
     @dispatch(str)
     def refuse(self, receiver: str) -> MessageBuilder:
         return self.create_message_builder(consts.REFUSE).to_agent(receiver)
+
     @dispatch(AgentId)
     def accept(self, receiver: AgentId) -> MessageBuilder:
         return self.create_message_builder(consts.ACCEPT).to_agent(receiver)
@@ -370,6 +372,15 @@ class AgentContext(KeyValueStorage, ModelsProvider, MessageSender, metaclass=ABC
     @dispatch(str)
     def accept(self, receiver: str) -> MessageBuilder:
         return self.create_message_builder(consts.ACCEPT).to_agent(receiver)
+
+    @dispatch(AgentId)
+    def acknowledge(self, receiver: AgentId) -> MessageBuilder:
+        return self.create_message_builder(consts.ACKNOWLEDGE).to_agent(receiver)
+
+    @dispatch(str)
+    def acknowledge(self, receiver: str) -> MessageBuilder:
+        return self.create_message_builder(consts.ACKNOWLEDGE).to_agent(receiver)
+
     def reply_with_inform(self, message: Message) -> MessageBuilder:
         return self.create_message_builder(consts.INFORM).to_agent(message.sender)
 
