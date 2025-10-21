@@ -38,18 +38,6 @@ class ShopListRequest(BaseModel):
     )
 
 
-class ShopListResponse(BaseModel):
-    """Response with total price for ingredients"""
-    total_price: int = Field(
-        description="Total price for all ingredients",
-        ge=0
-    )
-    missing_ingredients: List[str] = Field(
-        description="List of ingredients that are not available",
-        default_factory=list
-    )
-
-
 class ProposalBoard(BaseModel):
     agents: List[str] = Field(default_factory=list, description="Names of the agents who proposed")
     proposal: ShopList = Field(description="Current best proposal in ShopList format")
@@ -191,7 +179,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
 
         async def step(self):
             """Reply with the current state of the proposal board"""
-            await asyncio.sleep(1)
+            # await asyncio.sleep(5) # ошибка в том что если два сообщения одновременно приходят то обрабатывается только одно
             await self.context.reply_with_inform(self.message).with_content(self.agent.proposal_board)
 
     def setup(self):
@@ -696,6 +684,57 @@ class StartDialogueBehaviour(ContextBehaviour):
             logger.error("Error parsing act: %s\nRecovered JSON: %s", e, fixed)
             return Act(action=Conversate(offer="Извините, я не смог корректно ответить."))
 
+    async def generate_final_prices(self, dialogue_initiator_ingredients: Dict[str, int]) -> ShopList:
+        """
+        Определяет цены инициатора для своей части ингредиентов с помощью LLM,
+        используя контекст прошедшего диалога.
+        """
+        prompt = ChatPromptTemplate.from_template(
+            """Ты — агент магазина, завершивший переговоры с контрагентом и готовящий итоговую часть ставки.
+
+            На основе истории переговоров и согласованных ингредиентов рассчитай цены для своей доли в совместной ставке.
+
+            История переговоров:
+            {conversation_history}
+
+            Твой ассортимент и базовые цены:
+            {shop_sku}
+
+            Ингредиенты, которые поставляешь ты:
+            {dialogue_initiator_ingredients}
+
+            Условия:
+            - Твоя цель — получить прибыль, но при этом сохранить конкурентоспособность ставки.
+            - Можешь сделать наценку относительно базовой цены:
+                • 5–10% — если контрагент сильно давил на снижение цен или соглашение достигалось трудно.  
+                • 10–20% — если переговоры прошли в твою пользу или контрагент согласился быстро.
+            - Не ставь слишком высокую наценку (>25%), иначе:
+                • пользователь может не принять ставку,
+                • или ваша совместная ставка проиграет в аукционе.
+            - Рассчитывай реалистичные цены, чтобы предложение выглядело разумным и имело шанс выиграть.
+            - Возвращай только итоговые цены ТОЛЬКО для своей части ингредиентов.
+            """
+        )
+
+        class ShopListItem(BaseModel):
+            ingredient: str = Field(description="название ингредиента")
+            price: int = Field(description="цена за этот ингредиент")
+
+        class ShopListResponse(BaseModel):
+            """ Список ингредиентов и их цен """
+            ingredients: List[ShopListItem] = Field(
+                description="Список товаров с ценами")  # Вспомогательные структуры. Поле не может быть Dict для structured output
+
+        structured_llm = prompt | self.model.with_structured_output(ShopListResponse)
+        answer = await structured_llm.ainvoke({
+            "conversation_history": "\n".join(self.conversation_history),
+            "shop_sku": self.agent.shop_sku,
+            "dialogue_initiator_ingredients": dialogue_initiator_ingredients
+        })
+        result = ShopList(ingredients={item.ingredient: item.price for item in answer.ingredients})
+        # print('=================== Наценка ===================', sum(result.ingredients.values()) - sum(dialogue_initiator_ingredients.values()))
+        return result
+
     async def step(self):
         """Основной процесс инициации диалога"""
         logger.info("Starting dialogue with %s", self.contragent)
@@ -758,36 +797,35 @@ class StartDialogueBehaviour(ContextBehaviour):
             # print('===== COMPETITOR MESSAGE\n', competitor_msg)
             # если получили ShopList — контрагент согласен
             if isinstance(competitor_msg, ShopList):
+                # Логику множеств писал я :-)
+                A = set(self.user_request.ingredients)  # множество ингредиентов, которые нужны пользователю
+                B = self.agent.shop_sku  # словарь ассортимента инициатора {ингредиент: цена}
+                C = competitor_msg.ingredients  # словарь ингредиентов, предложенных контрагентом
 
-                # Создаем комбинированную ставку с ингредиентами обоих агентов
-                combined = {}
-                # Добавляем ингредиенты текущего агента (инициатора)
-                for item, price in self.agent.shop_sku.items():
-                    if item in self.user_request.ingredients:
-                        combined[item] = price
-                # print('\n' * 3, '===================ONLY FIRST ', combined)
-                first_agents_part = combined.copy()
-                second_agents_part = {}
-                # Применяем ингредиенты конкурента.
-                extras = {}  # ингредиенты которые контрагент дал сверх запроса пользователя
-                for item, price in competitor_msg.ingredients.items():
-                    if item in self.user_request.ingredients:
-                        combined[item] = price
-                        second_agents_part[item] = price
-                        if item in first_agents_part.keys():
-                            first_agents_part.pop(
-                                item)  # убираем из части первого агента ингредиенты которые поставляет второй
-                    else:
-                        extras[item] = price
-                if extras:
-                    print('\n' * 3, '=================== АГЕНТ ДАЛ СВЕРХ ЗАПРОСА', extras)
+                # С & A - ингредиенты от контрагента, которые идут в заказ
+                contragent_in_order = {item: price for item, price in C.items() if item in A}
 
-                self.agent.collaborators = sorted([self.context.agent_type, self.contragent])
+                # С \ (С & A) - ингредиенты, которые контрагент дал сверх того что нужны пользователю
+                extras = {item: price for item, price in C.items() if item not in A}
+
+                # B & (A \ (С & A)) - ингредиенты, которые поставляет инициатор диалога
+                initiator_in_order = {item: price for item, price in B.items()
+                                      if item in A and item not in contragent_in_order}
+
+                # (B & (A \ (С & A)))^* - ингредиенты, которые поставляет инициатор диалога с обновленными ценами
+                initiator_final_prices = await self.generate_final_prices(initiator_in_order)
+
+                # Совместная ставка
+                combined = {**initiator_final_prices.ingredients, **contragent_in_order}
+
+                # Обновляем ставку агента
                 self.agent.current_bid = AuctionProposal(
-                    authors=self.agent.collaborators,
+                    authors=sorted([self.context.agent_type, self.contragent]),
                     prop=ShopList(ingredients=combined),
-                    bid_ingredient_split={self.context.agent_type: first_agents_part,
-                                          self.contragent: second_agents_part}
+                    bid_ingredient_split={
+                        self.context.agent_type: initiator_final_prices.ingredients,
+                        self.contragent: contragent_in_order
+                    }
                 )
                 break
 
@@ -1068,9 +1106,10 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         await asyncio.sleep(self.config.bid_delay)
         await self.context.acknowledge('proposal_board').with_content('')
         response = await self.receive(
-            template=MessageTemplate(thread_id=self.context.thread_id, performative=consts.INFORM),
-            timeout=60,
-        )
+            template=MessageTemplate(thread_id=self.context.thread_id, performative=consts.INFORM), timeout=15)
+        if not response:
+            logger.error("No info about auction board after 15 seconds")
+            return None
         return ProposalBoard.model_validate_json(response.content)
 
     async def update_my_bid(self):
