@@ -4,6 +4,7 @@ import json
 import math
 import random
 import os, json
+import numpy as np
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Union
 
@@ -58,7 +59,7 @@ class ProposalBoardAgentConf(BaseModel):
     max_price: int = Field(default=1e9, description="Максимальная цена, которую готов заплатить пользователь")
 
 
-def probability_of_purchase(price: float, max_price: float, sensitivity: float = 0.05) -> float:
+def logit_probability_of_purchase(price: float, max_price: float, sensitivity: float = 0.05) -> float:
     """
     Вероятность, что пользователь купит товар по данной цене.
     Чем выше sensitivity, тем резче спад вероятности после max_price.
@@ -68,11 +69,50 @@ def probability_of_purchase(price: float, max_price: float, sensitivity: float =
     return prob
 
 
-def user_decision(price: float, max_price: float, sensitivity: float = 0.05) -> bool:
+def shifted_left_exp_purchase_prob(price: float, max_price: float, shift: float = 0.0, decay: float = 0.08) -> float:
+    """
+    Вероятность покупки с экспоненциальным спадом, начинающимся раньше лимита.
+
+    Параметры:
+    ----------
+    price : float
+        Текущая цена набора.
+    max_price : float
+        Лимит — цена, которую пользователь считает комфортной.
+    shift : float
+        Насколько раньше начинается спад вероятности (в тех же единицах, что и цена).
+        Например, shift=20 означает, что сомнение начинается при цене max_price - 20.
+    decay : float
+        Скорость экспоненциального спада после начала снижения вероятности.
+        Большее значение = резче падение вероятности.
+
+    Возвращает:
+    -----------
+    Вероятность покупки от 0 до 1.
+    """
+
+    # Точка, где вероятность начинает падать
+    start_price = max_price - shift
+
+    if price <= start_price:
+        prob = 1.0
+    else:
+        prob = math.exp(-decay * (price - start_price))
+    logger.info("Верояность покупки: %s", prob)
+    return prob
+
+
+def user_decision(price: float, max_price: float, function: str = "logit", shift: float = 0.0, decay: float = 0.05,
+                  sensitivity: float = 0.05) -> bool:
     """
     Симуляция факта покупки с вероятностью на основе логистической функции.
     """
-    p = probability_of_purchase(price, max_price, sensitivity)
+    if function == "logit":
+        p = logit_probability_of_purchase(price, max_price, sensitivity)
+    elif function == "exp":
+        p = shifted_left_exp_purchase_prob(price, max_price, shift, decay)
+    else:
+        raise ValueError(f"Неизвестная функция: {function}")
     result = random.random() < p
     logger.info("Покупатель решил купить: %s", result)
     return result
@@ -100,6 +140,8 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"=== Winning bid split log started at {timestamp} ===\n")
             f.write(f"Winning agents: {', '.join(self.proposal_board.agents)}\n")
+            f.write("=========================================\n")
+            f.write(f"Secret user reserve price was: {self.config.max_price}\n")
             f.write("=========================================\n\n")
             for agent, ingredients in self.proposal_board.bid_ingredient_split.items():
                 f.write(f"Agent [{agent}] (Ingredients):\n")
@@ -196,7 +238,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             total_price = sum(board.proposal.ingredients.values())
             limit = self.config.max_price
 
-            decision = user_decision(total_price, limit)
+            decision = user_decision(total_price, limit, 'exp', shift=10, decay=0.04)
             if decision:
                 await self.context.reply_with_inform(self.message).with_content(
                     f"Все ингредиенты найдены. Общая цена: {total_price}"
@@ -204,14 +246,15 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 self.agent._save_winning_bid_split()
                 return False  # повтор не нужен
             else:
-                logger.info(f"Сумма победной ставки {total_price} превышает лимит {limit}. ")
-                logger.info(f"Агенты знают что покупатель хочет платить меньше чем {total_price}")
-                logger.info("Запускаю дополнительный аукцион с ограничением цены.")
-
                 if board.user_wants_lower_than is None:
                     board.user_wants_lower_than = total_price
                 else:
                     board.user_wants_lower_than = min(board.user_wants_lower_than, total_price)
+
+                logger.info(f"Сумма победной ставки {total_price} превышает лимит {limit}. ")
+                logger.info(f"Агенты знают что покупатель хочет платить меньше чем {board.user_wants_lower_than}")
+                logger.info("Запускаю дополнительный аукцион с ограничением цены.")
+
                 board.proposal = ShopList()
                 board.agents.clear()
                 board.bid_ingredient_split.clear()
