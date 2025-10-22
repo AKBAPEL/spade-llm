@@ -17,7 +17,10 @@ agents:
 
   proposal_board:
     type_name: spade_llm.demo.platform.auction.agents.ProposalBoardAgent
-
+    args:
+      total_rounds: 3
+      stable_limit: 3
+      max_price: 750
   first_merchant:
     type_name: spade_llm.demo.platform.auction.agents.FirstMerchantAgent
     args:
@@ -26,17 +29,17 @@ agents:
     type_name: spade_llm.demo.platform.auction.agents.SecondMerchantAgent
     args:
       model: max
-  third_merchant:
-    type_name: spade_llm.demo.platform.auction.agents.ThirdMerchantAgent
-    args:
-      model: max
+#  third_merchant:
+#    type_name: spade_llm.demo.platform.auction.agents.ThirdMerchantAgent
+#    args:
+#      model: max
   # Console agent which listens for commands from console and sends them to the delegate agent
   console:
     type_name: spade_llm.agents.console.ConsoleAgent
     args:
       delegate_type: proposal_board
       prompt: Нажмите Enter
-      timeout: 100
+      timeout: 200
   df:
     type_name: spade_llm.demo.platform.contractnet.discovery.DirectoryFacilitatorAgent
 # Agents to wait for before stopping the system. The system stops when all agents from this list are stopped.

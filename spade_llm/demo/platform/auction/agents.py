@@ -46,11 +46,14 @@ class ProposalBoard(BaseModel):
     total_rounds: int = Field(default=0, description="Всего раундов аукциона")
     bid_ingredient_split: Dict[str, Dict[str, int]] = Field(default={},
                                                             description="Указывает на разделение ингредиентов для ставки между агентами")
+    user_wants_lower_than: Optional[int] = Field(default=None,
+                                                 description="Пользователь может заплатить за заказ только меньше, чем это значение ")
 
 
 class ProposalBoardAgentConf(BaseModel):
     total_rounds: int = Field(default=3, description="Общее количество раундов аукциона")
     stable_limit: int = Field(default=3, description="Сколько раундов подряд должна держаться ставка для завершения")
+    max_price: int = Field(default=1e9, description="Максимальная цена, которую готов заплатить пользователь")
 
 
 @configuration(ProposalBoardAgentConf)
@@ -108,13 +111,8 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             super().__init__(MessageTemplate.request())
             self.config = config
 
-        async def step(self) -> None:
-            """Run the auction process for the requested ingredients"""
-            self.agent.proposal_board = ProposalBoard(agents=[],
-                                                      proposal=ShopList(),
-                                                      sku_request=ShopListRequest(ingredients=self.ingredients))
-            await asyncio.sleep(1)
-
+        async def _run_auction_rounds(self) -> None:
+            """Запускает серию раундов аукциона с отслеживанием стабильности"""
             stable_rounds = 0
             last_winner = None
 
@@ -125,7 +123,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 request = AuctionContractNetInitiatorBehavior(
                     task=self.agent.proposal_board.sku_request,
                     context=self.context,
-                    time_to_wait_for_proposals=10
+                    time_to_wait_for_proposals=20
                 )
 
                 self.agent.proposal_board.round_number = round_number
@@ -155,20 +153,55 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                                 round_number, self.config.stable_limit)
                     break
 
-            requested_ingredients = set(self.agent.proposal_board.sku_request.ingredients)
-            proposed_ingredients = set(self.agent.proposal_board.proposal.ingredients.keys())
-            missing_ingredients = requested_ingredients - proposed_ingredients
+        async def _evaluate_results(self) -> bool:
+            """
+            Проверяет итоги аукциона.
+            Возвращает True, если нужно запустить повторный аукцион (например, если цена выше лимита).
+            """
+            board = self.agent.proposal_board
+            requested = set(board.sku_request.ingredients)
+            proposed = set(board.proposal.ingredients.keys())
+            missing = requested - proposed
 
-            if not missing_ingredients:
-                total_price = sum(self.agent.proposal_board.proposal.ingredients.values())
+            if missing:
+                await self.context.reply_with_inform(self.message).with_content(
+                    f"Не удалось собрать все ингредиенты: Отсутствуют: {', '.join(missing)}"
+                )
+                return False
+
+            # Тут мы понимаем что все ингредиенты собраны
+
+            total_price = sum(board.proposal.ingredients.values())
+            limit = self.config.max_price
+
+            if total_price <= limit:
                 await self.context.reply_with_inform(self.message).with_content(
                     f"Все ингредиенты найдены. Общая цена: {total_price}"
                 )
                 self.agent._save_winning_bid_split()
+                return False  # повтор не нужен
             else:
-                await self.context.reply_with_inform(self.message).with_content(
-                    f"Не удалось собрать все ингредиенты. Отсутствуют: {', '.join(missing_ingredients)}"
-                )
+                logger.info(f"Сумма победной ставки {total_price} превышает лимит {limit}. ")
+                logger.info(f"Агенты знают что покупатель хочет платить меньше чем {total_price}")
+                logger.info("Запускаю дополнительный аукцион с ограничением цены.")
+
+                board.user_wants_lower_than = total_price
+                board.proposal = ShopList()
+                board.agents.clear()
+                board.bid_ingredient_split.clear()
+                return True  # нужен повтор
+
+        async def step(self) -> None:
+            """Run the auction process for the requested ingredients"""
+            self.agent.proposal_board = ProposalBoard(agents=[],
+                                                      proposal=ShopList(),
+                                                      sku_request=ShopListRequest(ingredients=self.ingredients))
+            await asyncio.sleep(1)
+            for _ in range(3):
+                await self._run_auction_rounds()
+                need_repeat = await self._evaluate_results()
+                if not need_repeat:
+                    break
 
             # self.set_is_done()
 
@@ -422,6 +455,8 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
 
     async def find_agents(self, task: ShopListRequest) -> List[AgentDescription]:
         """Find agents capable of fulfilling the task"""
+        if task is None:
+            logger.error('NONE 1')
         await self.context.request(DF_ADDRESS).with_content(AgentSearchRequest(task=task.model_dump_json(), top_k=10))
         search = await self.receive(
             MessageTemplate(performative=consts.INFORM, thread_id=self.context.thread_id),
@@ -440,6 +475,8 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
 
         for agent in agents:
             sent.add(agent.id)
+            if self.task is None:
+                logger.error('NONE 2')
             await self.context.request_proposal(agent.id).with_content(self.task.model_dump_json())
 
         started = time.time()
@@ -535,7 +572,7 @@ class StartDialogueBehaviour(ContextBehaviour):
     """Behavior for initiating a dialogue with another merchant"""
 
     def __init__(self, context: AgentContext, config, contragent: str,
-                 needed_ingredients: ShopList, model: BaseChatModel, user_request: ShopListRequest):
+                 needed_ingredients: ShopList, model: BaseChatModel, user_request: ShopListRequest, user_max_price: int):
         super().__init__(context)
         self.config = config
         self.contragent = contragent
@@ -545,9 +582,9 @@ class StartDialogueBehaviour(ContextBehaviour):
         self.parser = PydanticOutputParser(pydantic_object=Act)
         self.shoplist_parser = PydanticOutputParser(pydantic_object=ShopList)
         self.conversate_parser = PydanticOutputParser(pydantic_object=Conversate)
-        self.merchant_prompt = DIALOGUE_INITIATOR_PROMPT
+        self.initiator_prompt = DIALOGUE_INITIATOR_PROMPT
         self.user_request = user_request
-
+        self.user_max_price = user_max_price
     # -----------------------
     # JSON УТИЛИТЫ
     # -----------------------
@@ -613,6 +650,8 @@ class StartDialogueBehaviour(ContextBehaviour):
     # -----------------------
     def _update_history(self, role: str, content: Union[ShopList, Conversate, Act]):
         """Добавляет запись в историю диалога"""
+        if content is None:
+            logger.error('NONE 3')
         msg = content.model_dump_json() if hasattr(content, "model_dump_json") else str(content)
         self.conversation_history.append(f"{role}: {msg}")
         if len(self.conversation_history) > 10:
@@ -662,13 +701,14 @@ class StartDialogueBehaviour(ContextBehaviour):
     # -----------------------
     async def process_response(self, interaction_data: dict) -> Act:
         """Обрабатывает ответ контрагента через модель"""
-        chain = self.merchant_prompt | self.model
+        chain = self.initiator_prompt | self.model
         answer = await chain.ainvoke({
             "conversation_history": "\n".join(self.conversation_history),
             "shop_sku": self.agent.shop_sku,
             "current_interaction_type": interaction_data["type"],
             "current_interaction_data": str(interaction_data["data"]),
             "format_instructions": self.parser.get_format_instructions(),
+            "user_max_price": self.user_max_price
         })
 
         # print("==== RAW LLM RESPONSE INITIATOR ====")
@@ -684,7 +724,8 @@ class StartDialogueBehaviour(ContextBehaviour):
             logger.error("Error parsing act: %s\nRecovered JSON: %s", e, fixed)
             return Act(action=Conversate(offer="Извините, я не смог корректно ответить."))
 
-    async def generate_final_prices(self, dialogue_initiator_ingredients: Dict[str, int]) -> ShopList:
+    async def generate_final_prices(self, dialogue_initiator_ingredients: Dict[str, int],
+                                    dialogue_contragent_ingredients: Dict[str, int]) -> ShopList:
         """
         Определяет цены инициатора для своей части ингредиентов с помощью LLM,
         используя контекст прошедшего диалога.
@@ -702,7 +743,11 @@ class StartDialogueBehaviour(ContextBehaviour):
 
             Ингредиенты, которые поставляешь ты:
             {dialogue_initiator_ingredients}
-
+            
+            Ингредиенты которые поставляет контрагент:
+            {dialogue_contragent_ingredients}
+            
+            
             Условия:
             - Твоя цель — получить прибыль, но при этом сохранить конкурентоспособность ставки.
             - Можешь сделать наценку относительно базовой цены:
@@ -713,6 +758,16 @@ class StartDialogueBehaviour(ContextBehaviour):
                 • или ваша совместная ставка проиграет в аукционе.
             - Рассчитывай реалистичные цены, чтобы предложение выглядело разумным и имело шанс выиграть.
             - Возвращай только итоговые цены ТОЛЬКО для своей части ингредиентов.
+            
+             Дополнительное условие:
+            Если переменная {user_max_price} не равна None, это означает, что пользователь отказался покупать набор по прежней цене.
+            Он готов заплатить максимум сумму {user_max_price}.
+            Поэтому:
+            - Итоговая общая стоимость (твои ингредиенты + ингредиенты контрагента) должна быть строго меньше этого лимита.
+            - Если ваша общая цена превысит {user_max_price}, пользователь просто не купит набор.
+            - В этом случае ставка будет отклонена, и ни ты, ни контрагент не получите прибыль.
+            - Рассчитай цены так, чтобы совместная ставка выглядела выгодно, уложилась в лимит пользователя и при этом приносила тебе умеренную прибыль (5–15%).
+            - Если общая сумма превысит лимит {user_max_price}, ставка будет автоматически отклонена системой и сделка не состоится.
             """
         )
 
@@ -729,7 +784,9 @@ class StartDialogueBehaviour(ContextBehaviour):
         answer = await structured_llm.ainvoke({
             "conversation_history": "\n".join(self.conversation_history),
             "shop_sku": self.agent.shop_sku,
-            "dialogue_initiator_ingredients": dialogue_initiator_ingredients
+            "dialogue_initiator_ingredients": dialogue_initiator_ingredients,
+            "dialogue_contragent_ingredients":dialogue_contragent_ingredients,
+            "user_max_price": self.user_max_price
         })
         result = ShopList(ingredients={item.ingredient: item.price for item in answer.ingredients})
         # print('=================== Наценка ===================', sum(result.ingredients.values()) - sum(dialogue_initiator_ingredients.values()))
@@ -749,6 +806,8 @@ class StartDialogueBehaviour(ContextBehaviour):
         while iteration < max_iterations:
             # отправка текущего предложения
             if isinstance(current_offer, (ShopList, Conversate)):
+                if current_offer is None:
+                    logger.error('NONE 4')
                 await thread.request(self.contragent).with_content(current_offer.model_dump_json())
             else:
                 logger.warning("Unexpected offer type: %s", type(current_offer))
@@ -813,7 +872,7 @@ class StartDialogueBehaviour(ContextBehaviour):
                                       if item in A and item not in contragent_in_order}
 
                 # (B & (A \ (С & A)))^* - ингредиенты, которые поставляет инициатор диалога с обновленными ценами
-                initiator_final_prices = await self.generate_final_prices(initiator_in_order)
+                initiator_final_prices = await self.generate_final_prices(initiator_in_order, contragent_in_order)
 
                 # Совместная ставка
                 combined = {**initiator_final_prices.ingredients, **contragent_in_order}
@@ -827,10 +886,13 @@ class StartDialogueBehaviour(ContextBehaviour):
                         self.contragent: contragent_in_order
                     }
                 )
+                print("BID UPDATED COLLABORATION")
                 break
 
             # если получили Conversate — продолжаем торг
             elif isinstance(competitor_msg, Conversate):
+                if competitor_msg is None:
+                    logger.error('NONE 6')
                 act = await self.process_response({
                     "type": msg_type,
                     "data": competitor_msg.model_dump(),
@@ -838,6 +900,8 @@ class StartDialogueBehaviour(ContextBehaviour):
                 self._update_history("Self", act.action)
                 current_offer = act.action
                 # print('MY MESSAGE   ', current_offer)
+                if act.action is None:
+                    logger.error('NONE 7')
                 if isinstance(act.action, ShopList):
                     await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
                 elif isinstance(act.action, Conversate):
@@ -1003,6 +1067,8 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         # print("++++ INCOMING INTERACTION ++++\n", current_interaction)
 
         self._update_history("Opponent", str(current_interaction), conversation_id)
+        if current_interaction is None:
+            logger.error('NONE 9')
         act = await self.process_interaction(
             {
                 "type": type(current_interaction).__name__,
@@ -1012,6 +1078,8 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         self._update_history("Self", str(act.action), conversation_id)
         # print("---- RESPONSE ACT ----\n", act.action)
 
+        if act.action is None:
+            logger.error('NONE 10')
         # Отправка корректного ответа
         if isinstance(act.action, ShopList):
             await self.context.reply_with_acknowledge(self.message).with_content(
@@ -1036,7 +1104,7 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         self.model = model
         self.decision_parser = PydanticOutputParser(pydantic_object=Decision)
         self.shoplist_parser = PydanticOutputParser(pydantic_object=ShopList)
-        self.merchant_prompt = AUCTION_BIDDER_PROMPT
+        self.bidder_prompt = AUCTION_BIDDER_PROMPT
 
     def clean_json(self, text: str) -> str:
         """Clean the JSON string by removing markdown code blocks and extra text."""
@@ -1117,13 +1185,14 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         current_board = await self.get_current_board()
         if self.context.agent_type not in current_board.agents:
             agents_able = [a for a in ["first_merchant", "second_merchant"] if a != self.context.agent_type]
-            chain = self.merchant_prompt | self.model
+            chain = self.bidder_prompt | self.model
             await asyncio.sleep(self.config.bid_delay)
             answer = await chain.ainvoke({
                 "my_sku": self.agent.shop_sku,
                 "current_board": current_board,
                 "format_instructions": self.decision_parser.get_format_instructions(),
-                "agents_able_to_conversate": agents_able
+                "agents_able_to_conversate": agents_able,
+                "user_max_price": current_board.user_wants_lower_than
             })
 
             # print('000000 НАЧАЛО \n', answer.content)
@@ -1141,38 +1210,38 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
                     prop=response,
                     bid_ingredient_split={self.context.agent_type: response.ingredients}
                 )
+                print("BID UPDATED Instantly")
             elif isinstance(response, CollaborationProposal):
                 contragent = response.target_agent
                 print("DIALOGUE STARTED WITH CONTRAGENT", contragent)
                 needed = response.needed_ingredients
                 start_conversation = StartDialogueBehaviour(
-                    self.context, self.config, contragent, needed, self.model, current_board.sku_request
+                    self.context, self.config, contragent, needed, self.model, current_board.sku_request, current_board.user_wants_lower_than
                 )
                 self.agent.add_behaviour(start_conversation)
                 await start_conversation.join()
                 print("DIALOGUE FINISHED WITH CONTRAGENT", contragent)
                 if self.agent.current_bid is None:
-                    chain = self.merchant_prompt | self.model
-                    await asyncio.sleep(self.config.bid_delay)
-                    fallback_answer = await chain.ainvoke({
-                        "my_sku": self.agent.shop_sku,
-                        "current_board": current_board,
-                        "format_instructions": self.shoplist_parser.get_format_instructions(),
-                        "agents_able_to_conversate": agents_able,
-                        "self_type": self.context.agent_type
-                    })
-                    fallback_data = self.safe_json_loads(fallback_answer.content)
-                    normalized_fallback = self.normalize_llm_output(fallback_data)
-                    fallback_prop = self.shoplist_parser.parse(json.dumps(normalized_fallback))
                     self.agent.current_bid = AuctionProposal(
                         authors=[self.context.agent_type],
-                        prop=fallback_prop,
-                        bid_ingredient_split={self.context.agent_type: fallback_prop.ingredients}
+                        prop=ShopList(ingredients={}),
+                        bid_ingredient_split={self.context.agent_type: {}}
                     )
+                    print("BID UPDATED FALLBACK")
+        else:
+            print("ALREADY IN WINNING POSITION")
 
     async def get_my_bid(self):
         """Generate and return the agent's current bid"""
         await self.update_my_bid()
+        if self.agent.current_bid is None:
+            logger.warning("Current bid is None")
+            self.agent.current_bid = AuctionProposal(
+                authors=[self.context.agent_type],
+                prop=ShopList(ingredients={}),
+                bid_ingredient_split={self.context.agent_type: {}}
+            )
+            print("BID UPDATED EMPTY")
         return self.agent.current_bid.model_dump_json()
 
     async def step(self) -> None:
@@ -1182,7 +1251,7 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         await self.context.reply_with_propose(self.message).with_content(my_bid)
         response = await self.receive(MessageTemplate(thread_id=self.context.thread_id), timeout=15)
         if response is None:
-            logger.warning("No response received from %s", self.message.sender)
+            logger.warning("No response received from %s to bidder %s", self.message.sender, self.context.agent_type)
         elif response.content == 'UPDATING':
             logger.info("Received UPDATING response")
         elif response.performative == consts.ACCEPT:
