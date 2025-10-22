@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import json
+import math
+import random
 import os, json
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Union
@@ -54,6 +56,26 @@ class ProposalBoardAgentConf(BaseModel):
     total_rounds: int = Field(default=3, description="Общее количество раундов аукциона")
     stable_limit: int = Field(default=3, description="Сколько раундов подряд должна держаться ставка для завершения")
     max_price: int = Field(default=1e9, description="Максимальная цена, которую готов заплатить пользователь")
+
+
+def probability_of_purchase(price: float, max_price: float, sensitivity: float = 0.05) -> float:
+    """
+    Вероятность, что пользователь купит товар по данной цене.
+    Чем выше sensitivity, тем резче спад вероятности после max_price.
+    """
+    prob = 1 / (1 + math.exp(sensitivity * (price - max_price)))
+    logger.info("Верояность покупки: %s", prob)
+    return prob
+
+
+def user_decision(price: float, max_price: float, sensitivity: float = 0.05) -> bool:
+    """
+    Симуляция факта покупки с вероятностью на основе логистической функции.
+    """
+    p = probability_of_purchase(price, max_price, sensitivity)
+    result = random.random() < p
+    logger.info("Покупатель решил купить: %s", result)
+    return result
 
 
 @configuration(ProposalBoardAgentConf)
@@ -164,7 +186,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             missing = requested - proposed
 
             if missing:
-                await self.context.reply_with_inform(self.message).with_content(
+                await self.context.reply_with_failure(self.message).with_content(
                     f"Не удалось собрать все ингредиенты: Отсутствуют: {', '.join(missing)}"
                 )
                 return False
@@ -174,7 +196,8 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             total_price = sum(board.proposal.ingredients.values())
             limit = self.config.max_price
 
-            if total_price <= limit:
+            decision = user_decision(total_price, limit)
+            if decision:
                 await self.context.reply_with_inform(self.message).with_content(
                     f"Все ингредиенты найдены. Общая цена: {total_price}"
                 )
@@ -185,7 +208,10 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 logger.info(f"Агенты знают что покупатель хочет платить меньше чем {total_price}")
                 logger.info("Запускаю дополнительный аукцион с ограничением цены.")
 
-                board.user_wants_lower_than = total_price
+                if board.user_wants_lower_than is None:
+                    board.user_wants_lower_than = total_price
+                else:
+                    board.user_wants_lower_than = min(board.user_wants_lower_than, total_price)
                 board.proposal = ShopList()
                 board.agents.clear()
                 board.bid_ingredient_split.clear()
@@ -202,7 +228,10 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 need_repeat = await self._evaluate_results()
                 if not need_repeat:
                     break
-
+            else:
+                await self.context.reply_with_failure(self.message).with_content(
+                    f"Не удалось предложить подходящую цену."
+                )
             # self.set_is_done()
 
     class RequestInfoBehaviour(MessageHandlingBehavior):
@@ -572,7 +601,8 @@ class StartDialogueBehaviour(ContextBehaviour):
     """Behavior for initiating a dialogue with another merchant"""
 
     def __init__(self, context: AgentContext, config, contragent: str,
-                 needed_ingredients: ShopList, model: BaseChatModel, user_request: ShopListRequest, user_max_price: int):
+                 needed_ingredients: ShopList, model: BaseChatModel, user_request: ShopListRequest,
+                 user_max_price: int):
         super().__init__(context)
         self.config = config
         self.contragent = contragent
@@ -585,6 +615,7 @@ class StartDialogueBehaviour(ContextBehaviour):
         self.initiator_prompt = DIALOGUE_INITIATOR_PROMPT
         self.user_request = user_request
         self.user_max_price = user_max_price
+
     # -----------------------
     # JSON УТИЛИТЫ
     # -----------------------
@@ -785,7 +816,7 @@ class StartDialogueBehaviour(ContextBehaviour):
             "conversation_history": "\n".join(self.conversation_history),
             "shop_sku": self.agent.shop_sku,
             "dialogue_initiator_ingredients": dialogue_initiator_ingredients,
-            "dialogue_contragent_ingredients":dialogue_contragent_ingredients,
+            "dialogue_contragent_ingredients": dialogue_contragent_ingredients,
             "user_max_price": self.user_max_price
         })
         result = ShopList(ingredients={item.ingredient: item.price for item in answer.ingredients})
@@ -866,7 +897,8 @@ class StartDialogueBehaviour(ContextBehaviour):
 
                 # С \ (С & A) - ингредиенты, которые контрагент дал сверх того что нужны пользователю
                 extras = {item: price for item, price in C.items() if item not in A}
-
+                if extras:
+                    logger.info(f"Agent {self.contragent} sold extras: {extras} to {self.context.agent_type}")
                 # B & (A \ (С & A)) - ингредиенты, которые поставляет инициатор диалога
                 initiator_in_order = {item: price for item, price in B.items()
                                       if item in A and item not in contragent_in_order}
@@ -1216,7 +1248,8 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
                 print("DIALOGUE STARTED WITH CONTRAGENT", contragent)
                 needed = response.needed_ingredients
                 start_conversation = StartDialogueBehaviour(
-                    self.context, self.config, contragent, needed, self.model, current_board.sku_request, current_board.user_wants_lower_than
+                    self.context, self.config, contragent, needed, self.model, current_board.sku_request,
+                    current_board.user_wants_lower_than
                 )
                 self.agent.add_behaviour(start_conversation)
                 await start_conversation.join()
