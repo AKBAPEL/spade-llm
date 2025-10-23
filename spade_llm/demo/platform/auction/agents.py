@@ -136,12 +136,46 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             "second_merchant": SecondMerchantAgent.shop_sku,
             "third_merchant": ThirdMerchantAgent.shop_sku
         }
+        ###################### МЕТРИКИ ######################
+        # Вычисляем общие метрики
+        total_P = sum(self.proposal_board.proposal.ingredients.values())  # Итоговая цена (P)
+        total_C = sum(
+            agent_shop_sku[agent].get(ingr, 0)
+            for agent, ingredients in self.proposal_board.bid_ingredient_split.items()
+            for ingr in ingredients.keys()
+        )  # Себестоимость (C)
+        V = self.config.max_price  # Резервная цена (V)
 
+        # Защита от деления на ноль
+        P_safe = total_P if total_P > 0 else 1
+        C_safe = total_C if total_C > 0 else 1
+
+        # Метрика 1: (V-P)/P * (P-C)/P
+        if P_safe > 0:
+            metric_1 = ((V - total_P) / P_safe) * ((total_P - total_C) / P_safe)
+        else:
+            metric_1 = 0.0
+
+        # Метрика 2: продукт маржинальности по агентам
+        agent_margins = []
+        for agent, ingredients in self.proposal_board.bid_ingredient_split.items():
+            P_i = sum(ingredients.values())
+            C_i = sum(agent_shop_sku[agent].get(ingr, 0) for ingr in ingredients.keys())
+            margin_i = (P_i - C_i) / (C_i if C_i > 0 else 1)
+            agent_margins.append(margin_i)
+
+        metric_2 = np.prod(agent_margins) if agent_margins else 0.0
+        #####################################################
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"=== Winning bid split log started at {timestamp} ===\n")
             f.write(f"Winning agents: {', '.join(self.proposal_board.agents)}\n")
             f.write("=========================================\n")
-            f.write(f"Secret user reserve price was: {self.config.max_price}\n")
+            f.write(f"Secret user reserve price (V): {V}\n")
+            f.write(f"Winning bid total price (P): {total_P}\n")
+            f.write(f"Total cost for agents (C): {total_C}\n")
+            f.write("\n")
+            f.write(f"Metric 1: (V-P)/P * (P-C)/P = {metric_1:.6f}\n")
+            f.write(f"Metric 2: ∏((P_i - C_i)/C_i) = {metric_2:.6f}\n")
             f.write("=========================================\n\n")
             for agent, ingredients in self.proposal_board.bid_ingredient_split.items():
                 f.write(f"Agent [{agent}] (Ingredients):\n")
