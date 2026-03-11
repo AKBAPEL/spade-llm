@@ -31,7 +31,7 @@ class ReactBehaviour(MessageHandlingBehavior):
     async def step(self):
         if not self.message:
             return
-
+        # НАДО сохранить локально msg=self.message иначе конка потоков
         self.logger.debug("Handling message %s", self.message)
         tools = self.context.get_tools(self.agent)
 

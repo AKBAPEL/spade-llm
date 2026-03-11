@@ -251,7 +251,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                                 round_number, self.config.stable_limit)
                     break
 
-        async def _evaluate_results(self) -> bool:
+        async def _evaluate_results(self, msg) -> bool:
             """
             Проверяет итоги аукциона.
             Возвращает True, если нужно запустить повторный аукцион (например, если цена выше лимита).
@@ -262,7 +262,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             missing = requested - proposed
 
             if missing:
-                await self.context.reply_with_failure(self.message).with_content(
+                await self.context.reply_with_failure(msg).with_content(
                     f"Не удалось собрать все ингредиенты: Отсутствуют: {', '.join(missing)}"
                 )
                 return False
@@ -274,7 +274,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
 
             decision = user_decision(total_price, limit, 'exp', shift=10, decay=0.04)
             if decision:
-                await self.context.reply_with_inform(self.message).with_content(
+                await self.context.reply_with_inform(msg).with_content(
                     f"Все ингредиенты найдены. Общая цена: {total_price}"
                 )
                 self.agent._save_winning_bid_split()
@@ -296,20 +296,22 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
 
         async def step(self) -> None:
             """Run the auction process for the requested ingredients"""
-            self.agent.proposal_board = ProposalBoard(agents=[],
-                                                      proposal=ShopList(),
-                                                      sku_request=ShopListRequest(ingredients=self.ingredients))
-            await asyncio.sleep(1)
-            for _ in range(3):
-                await self._run_auction_rounds()
-                need_repeat = await self._evaluate_results()
-                if not need_repeat:
-                    break
-            else:
-                await self.context.reply_with_failure(self.message).with_content(
-                    f"Не удалось предложить подходящую цену."
-                )
-            # self.set_is_done()
+            msg = self.message
+            if msg:
+                self.agent.proposal_board = ProposalBoard(agents=[],
+                                                          proposal=ShopList(),
+                                                          sku_request=ShopListRequest(ingredients=self.ingredients))
+                await asyncio.sleep(1)
+                for _ in range(3):
+                    await self._run_auction_rounds()
+                    need_repeat = await self._evaluate_results(msg)
+                    if not need_repeat:
+                        break
+                else:
+                    await self.context.reply_with_failure(msg).with_content(
+                        f"Не удалось предложить подходящую цену."
+                    )
+                # self.set_is_done()
 
     class RequestInfoBehaviour(MessageHandlingBehavior):
         def __init__(self, config: ProposalBoardAgentConf):
@@ -319,7 +321,9 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
         async def step(self):
             """Reply with the current state of the proposal board"""
             # await asyncio.sleep(5) # ошибка в том что если два сообщения одновременно приходят то обрабатывается только одно
-            await self.context.reply_with_inform(self.message).with_content(self.agent.proposal_board)
+            msg = self.message
+            if msg:
+                await self.context.reply_with_inform(msg).with_content(self.agent.proposal_board)
 
     def setup(self):
         """Initialize agent behaviors"""
@@ -394,7 +398,7 @@ class FirstMerchantAgent(Agent, Configurable[FirstMerchantAgentConf]):
 
 class SecondMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
-    bid_delay: float = Field(default=1.5, description="Delay between bids")
+    bid_delay: float = Field(default=1, description="Delay between bids")
 
 
 @configuration(SecondMerchantAgentConf)
@@ -457,7 +461,7 @@ class SecondMerchantAgent(Agent, Configurable[SecondMerchantAgentConf]):
 
 class ThirdMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
-    bid_delay: float = Field(default=2, description="Delay between bids")
+    bid_delay: float = Field(default=1, description="Delay between bids")
 
 
 @configuration(ThirdMerchantAgentConf)
@@ -816,7 +820,8 @@ class StartDialogueBehaviour(ContextBehaviour):
             "current_interaction_type": interaction_data["type"],
             "current_interaction_data": str(interaction_data["data"]),
             "format_instructions": self.parser.get_format_instructions(),
-            "user_max_price": self.user_max_price
+            "user_max_price": self.user_max_price,
+            "user_request": self.user_request.model_dump_json()  # Для LLM
         })
 
         # print("==== RAW LLM RESPONSE INITIATOR ====")
@@ -851,11 +856,11 @@ class StartDialogueBehaviour(ContextBehaviour):
 
             Ингредиенты, которые поставляешь ты:
             {dialogue_initiator_ingredients}
-            
+
             Ингредиенты которые поставляет контрагент:
             {dialogue_contragent_ingredients}
-            
-            
+
+
             Условия:
             - Твоя цель — получить прибыль, но при этом сохранить конкурентоспособность ставки.
             - Можешь сделать наценку относительно базовой цены:
@@ -866,7 +871,7 @@ class StartDialogueBehaviour(ContextBehaviour):
                 • или ваша совместная ставка проиграет в аукционе.
             - Рассчитывай реалистичные цены, чтобы предложение выглядело разумным и имело шанс выиграть.
             - Возвращай только итоговые цены ТОЛЬКО для своей части ингредиентов.
-            
+
              Дополнительное условие:
             Если переменная {user_max_price} не равна None, это означает, что пользователь отказался покупать набор по прежней цене.
             Он готов заплатить максимум сумму {user_max_price}.
@@ -916,7 +921,12 @@ class StartDialogueBehaviour(ContextBehaviour):
             if isinstance(current_offer, (ShopList, Conversate)):
                 if current_offer is None:
                     logger.error('NONE 4')
-                await thread.request(self.contragent).with_content(current_offer.model_dump_json())
+                message_data = {
+                    "action": current_offer.model_dump(),
+                    "user_request": self.user_request.model_dump()  # Вот и всё!
+                }
+                await thread.request(self.contragent).with_content(json.dumps(message_data))
+                # await thread.request(self.contragent).with_content(current_offer.model_dump_json())
             else:
                 logger.warning("Unexpected offer type: %s", type(current_offer))
                 break
@@ -959,10 +969,7 @@ class StartDialogueBehaviour(ContextBehaviour):
                 logger.error("Unrecognized message from %s: %s", self.contragent, data)
                 break
 
-            # print("++++ INCOMING RESPONSE INITIATOR ++++\n", competitor_msg)
             self._update_history("Opponent", competitor_msg)
-            # print('===== COMPETITOR MESSAGE\n', competitor_msg)
-            # если получили ShopList — контрагент согласен
             if isinstance(competitor_msg, ShopList):
                 # Логику множеств писал я :-)
                 A = set(self.user_request.ingredients)  # множество ингредиентов, которые нужны пользователю
@@ -1011,10 +1018,14 @@ class StartDialogueBehaviour(ContextBehaviour):
                 # print('MY MESSAGE   ', current_offer)
                 if act.action is None:
                     logger.error('NONE 7')
-                if isinstance(act.action, ShopList):
-                    await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
-                elif isinstance(act.action, Conversate):
-                    await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
+                if isinstance(act.action, ShopList) or isinstance(act.action, Conversate):
+                    # await thread.acknowledge(self.contragent).with_content(act.action.model_dump_json())
+                    # Вместо простого ack с act.action
+                    response_data = {
+                        "action": act.action.model_dump(),
+                        "user_request": self.user_request.model_dump()
+                    }
+                    await thread.acknowledge(self.contragent).with_content(json.dumps(response_data))
                 else:
                     logger.warning("Unexpected action type: %s", type(act.action))
                     break
@@ -1036,7 +1047,7 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         self.parser = PydanticOutputParser(pydantic_object=Act)
         self.conversation_history = dict()
         self.merchant_prompt = DIALOGUE_RESPONDER_PROMPT
-
+        self.user_requests: Dict[str, ShopListRequest] = {}  # conversation_id -> запрос
     # -----------------------
     # JSON УТИЛИТЫ
     # -----------------------
@@ -1122,6 +1133,7 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             "current_interaction_type": interaction_data["type"],
             "current_interaction_data": str(interaction_data["data"]),
             "format_instructions": self.parser.get_format_instructions(),
+            "user_request": self.user_requests[conversation_id].model_dump_json()
         })
 
         # print("==== RAW LLM RESPONSE ====")
@@ -1138,21 +1150,21 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
 
     async def step(self):
         """Обработка входящего сообщения диалога."""
-        raw_content = self.message.content.strip()
-        conversation_id = self.message.thread_id
+        msg = self.message
+        raw_content = msg.content.strip()
+        conversation_id = msg.thread_id
         if conversation_id not in self.conversation_history.keys():
             self.conversation_history[conversation_id] = list()
-
-        # print('\n\n\n  ++  initiator is', self.message.sender, '\n\n\n------------',
-        #       len(self.conversation_history[conversation_id]), '------',
-        #       self.message.thread_id)
 
         cleaned = self.clean_json(raw_content)
         # Разбор входящего JSON
         try:
             data = json.loads(cleaned)
+            user_request_data = data.get("user_request", {})
+            if user_request_data:
+                self.user_requests[conversation_id] = ShopListRequest.model_validate(user_request_data)
         except json.JSONDecodeError:
-            await self.context.reply_with_refuse(self.message).with_content("Некорректный формат JSON")
+            await self.context.reply_with_refuse(msg).with_content("Некорректный формат JSON")
             return
 
         # Определяем тип взаимодействия
@@ -1169,11 +1181,9 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             elif "ingredients" in action_data:
                 current_interaction = ShopList.model_validate(action_data)
         else:
-            await self.context.reply_with_refuse(self.message).with_content(
+            await self.context.reply_with_refuse(msg).with_content(
                 "Invalid request format: missing required fields")
             return
-
-        # print("++++ INCOMING INTERACTION ++++\n", current_interaction)
 
         self._update_history("Opponent", str(current_interaction), conversation_id)
         if current_interaction is None:
@@ -1191,15 +1201,15 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             logger.error('NONE 10')
         # Отправка корректного ответа
         if isinstance(act.action, ShopList):
-            await self.context.reply_with_acknowledge(self.message).with_content(
+            await self.context.reply_with_acknowledge(msg).with_content(
                 act.action.model_dump_json()
             )
         elif isinstance(act.action, Conversate):
-            await self.context.reply_with_acknowledge(self.message).with_content(
+            await self.context.reply_with_acknowledge(msg).with_content(
                 act.action.model_dump_json()
             )
         else:
-            await self.context.reply_with_refuse(self.message).with_content(
+            await self.context.reply_with_refuse(msg).with_content(
                 "Unexpected action type"
             )
 
@@ -1356,17 +1366,19 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
 
     async def step(self) -> None:
         """Handle the bidding process"""
-        my_bid = await self.get_my_bid()
-        await asyncio.sleep(self.config.bid_delay)
-        await self.context.reply_with_propose(self.message).with_content(my_bid)
-        response = await self.receive(MessageTemplate(thread_id=self.context.thread_id), timeout=15)
-        if response is None:
-            logger.warning("No response received from %s to bidder %s", self.message.sender, self.context.agent_type)
-        elif response.content == 'UPDATING':
-            logger.info("Received UPDATING response")
-        elif response.performative == consts.ACCEPT:
-            pass
-        elif response.performative == consts.REFUSE:
-            await self.update_my_bid()
-        else:
-            pass
+        msg = self.message
+        if msg:
+            my_bid = await self.get_my_bid()
+            await asyncio.sleep(self.config.bid_delay)
+            await self.context.reply_with_propose(msg).with_content(my_bid)
+            response = await self.receive(MessageTemplate(thread_id=self.context.thread_id), timeout=15)
+            if response is None:
+                logger.warning("No response received from %s to bidder %s", msg.sender, self.context.agent_type)
+            elif response.content == 'UPDATING':
+                logger.info("Received UPDATING response")
+            elif response.performative == consts.ACCEPT:
+                pass
+            elif response.performative == consts.REFUSE:
+                await self.update_my_bid()
+            else:
+                pass
