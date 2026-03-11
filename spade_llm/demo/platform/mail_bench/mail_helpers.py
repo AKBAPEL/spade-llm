@@ -127,7 +127,7 @@ class MailToolkit(BaseToolkit):
 
     def get_tools(self) -> List[BaseTool]:
         return [
-            self._create_list_mails_tool(),
+            #self._create_list_mails_tool(),
             self._create_get_mail_tool(),
             self._create_delete_mail_tool(),
         ]

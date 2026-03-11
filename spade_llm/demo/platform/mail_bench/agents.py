@@ -4,7 +4,7 @@ agents.py — EnvironmentAgent (загрузка сценариев, оценк�
 
 import asyncio
 import logging
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
@@ -23,6 +23,14 @@ from spade_llm.demo.platform.mail_bench.scenario import (
     load_scenario, Scenario, ScenarioEmail
 )
 
+try:
+    from mem0 import Memory
+
+    MEM0_AVAILABLE = True
+except ImportError:
+    MEM0_AVAILABLE = False
+    print("Mem0 is not available")
+    Memory = None
 logger = logging.getLogger(__name__)
 
 
@@ -37,7 +45,6 @@ class EnvironmentAgentConf(BaseModel):
 
 @configuration(EnvironmentAgentConf)
 class EnvironmentAgent(Agent, Configurable[EnvironmentAgentConf]):
-
     class RunScenarioBehaviour(MessageHandlingBehavior):
 
         def __init__(self, config: EnvironmentAgentConf, eval_model: BaseChatModel):
@@ -46,6 +53,12 @@ class EnvironmentAgent(Agent, Configurable[EnvironmentAgentConf]):
             self.eval_model = eval_model
 
         # ---------- вспомогательное ----------
+        async def _notify_mail_agent(self, email_id: str):
+            try:
+                await self.context.inform("mail_agent").with_content(email_id)
+                logger.debug("Notification sent for email %s", email_id)
+            except Exception as e:
+                logger.warning("Failed to notify mail_agent: %s", e)
 
         def _populate_immediate(self, scenario: Scenario, mailbox: Mailbox) -> Dict[str, str]:
             """
@@ -59,6 +72,7 @@ class EnvironmentAgent(Agent, Configurable[EnvironmentAgentConf]):
             for se in immediate:
                 msg = self._scenario_email_to_mail(se, thread_map)
                 mailbox.add_message(msg)
+                asyncio.create_task(self._notify_mail_agent(se.id))
                 thread_map[se.id] = msg.thread_id
             return thread_map
 
@@ -77,6 +91,7 @@ class EnvironmentAgent(Agent, Configurable[EnvironmentAgentConf]):
                     elapsed = se.delay
                 msg = self._scenario_email_to_mail(se, thread_map)
                 mailbox.add_message(msg)
+                await self._notify_mail_agent(se.id)
                 thread_map[se.id] = msg.thread_id
                 logger.info("Delayed email '%s' delivered after %.1fs", se.id, se.delay)
 
@@ -178,9 +193,9 @@ class EnvironmentAgent(Agent, Configurable[EnvironmentAgentConf]):
             pct = (passed / total * 100) if total > 0 else 0
 
             report_lines = [
-                f"\n{'='*60}",
+                f"\n{'=' * 60}",
                 f"  BENCHMARK RESULTS: {scenario.name}",
-                f"{'='*60}",
+                f"{'=' * 60}",
             ]
             for i, r in enumerate(results, 1):
                 mark = "✅" if r["correct"] else "❌"
@@ -190,7 +205,7 @@ class EnvironmentAgent(Agent, Configurable[EnvironmentAgentConf]):
                 report_lines.append("")
 
             report_lines.append(f"  SCORE: {passed}/{total} ({pct:.0f}%)")
-            report_lines.append(f"{'='*60}\n")
+            report_lines.append(f"{'=' * 60}\n")
 
             report = "\n".join(report_lines)
             print(report)
@@ -212,16 +227,47 @@ class EnvironmentAgent(Agent, Configurable[EnvironmentAgentConf]):
 class MailAgentConf(BaseModel):
     model: str = Field(description="Model to use for handling messages")
     max_iterations: int = Field(default=10, description="Max tool-call iterations per message")
+    # Опции памяти Mem0
+    use_memory: bool = Field(default=False, description="Enable Mem0 long-term memory")
+    memory_config: Optional[dict] = Field(
+        default=None,
+        description="Configuration dict for Mem0 (if None and use_memory=True, uses default)"
+    )
 
 
 class MailRequestBehaviour(MessageHandlingBehavior):
 
-    def __init__(self, template: MessageTemplate, system_prompt: str,
-                 model: BaseChatModel, max_iterations: int):
-        super().__init__(template)
+    def __init__(self, system_prompt: str,
+                 model: BaseChatModel,
+                 max_iterations: int,
+                 memory: Optional[Memory] = None,
+                 user_id: str = "mail_agent_user",
+                 email_store: Optional[List] = None):
+        super().__init__(MessageTemplate.request())
         self.max_iterations = max_iterations
         self.model = model
-        self.initial_messages = [SystemMessage(system_prompt)]
+        self.base_system_prompt = system_prompt
+        self.memory = memory
+        self.user_id = user_id
+        self.email_store = email_store
+    async def _ainvoke_with_retry(self, model, messages, max_retries=5, base_delay=1):
+        """Вызов model.ainvoke с повторными попытками при ошибках 429 и других временных сбоях."""
+        for attempt in range(max_retries):
+            try:
+                return await model.ainvoke(messages)
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise  # последняя попытка – пробрасываем исключение
+                error_str = str(e).lower()
+                # Проверяем наличие признаков rate limit (429)
+                if "429" in error_str or "too many requests" in error_str:
+                    delay = base_delay * (2 ** attempt)
+                    self.logger.warning(f"Rate limited (429), retrying in {delay}s (attempt {attempt+1}/{max_retries})")
+                else:
+                    delay = base_delay * (2 ** attempt)
+                    self.logger.warning(f"Temporary error: {e}, retrying in {delay}s (attempt {attempt+1}/{max_retries})")
+                await asyncio.sleep(delay)
+        raise RuntimeError("Max retries exceeded without successful response")
 
     async def step(self):
         if not self.message:
@@ -234,12 +280,38 @@ class MailRequestBehaviour(MessageHandlingBehavior):
         model = self.model.bind_tools(tools)
         tools_dict = {t.name: t for t in tools}
 
-        history = []
+        # Подготовка системного промпта с учётом памяти (если включена)
+        system_prompt = self.base_system_prompt
+        if self.memory:
+            try:
+                # Поиск релевантных воспоминаний
+                memories = self.memory.search(
+                    query=msg.content,
+                    user_id=self.user_id,
+                    limit=3
+                )
+                memories_text = "\n".join(
+                    f"- {m['memory']}" for m in memories.get("results", [])
+                )
+                if memories_text:
+                    system_prompt += f"\n\nRelevant memories:\n{memories_text}"
+                    self.logger.debug("Added %d memories to prompt", len(memories["results"]))
+            except Exception as e:
+                self.logger.warning("Failed to retrieve memories: %s", e)
+        elif self.email_store is not None:
+            # Если память отключена, используем локальное хранилище писем
+            if self.email_store:
+                emails_text = "\n".join(self.email_store)
+                system_prompt += f"\n\nReceived emails:\n{emails_text}"
+                self.logger.debug("Added %d emails to prompt", len(self.email_store))
+        # Начальные сообщения (системное + пользовательское)
+        current_messages = [SystemMessage(system_prompt)]
         user_message = HumanMessage(msg.content)
+        history = []  # будет содержать всё, что после user_message
 
-        for _ in range(self.max_iterations):
-            answer = await model.ainvoke(
-                self.initial_messages + [user_message] + history
+        for iteration in range(self.max_iterations):
+            answer = await self._ainvoke_with_retry(
+                model, current_messages + [user_message] + history
             )
             self.logger.debug("Got answer %s", answer)
             history.append(answer)
@@ -259,25 +331,128 @@ class MailRequestBehaviour(MessageHandlingBehavior):
                         )
                         return
             else:
-                await self.context.reply_with_inform(msg).with_content(answer.content)
+                # Финальный ответ без вызова инструментов
+                reply_content = answer.content
+                await self.context.reply_with_inform(msg).with_content(reply_content)
                 return
 
         # Исчерпаны итерации
         await self.context.reply_with_failure(msg).with_content("Max iterations reached")
 
 
+class MailReceiveBehaviour(MessageHandlingBehavior):
+    def __init__(self, memory: Optional[Memory] = None,
+                 user_id: str = "mail_agent_user",
+                 email_store: Optional[List] = None):
+        super().__init__(MessageTemplate.inform())
+        self.memory = memory
+        self.user_id = user_id
+        self.received_email_ids: List[str] = []  # локальное хранилище при отключённой памяти
+        self.email_store = email_store  # сохраняем
+
+    async def step(self):
+        if not self.message:
+            return
+
+        msg = self.message
+        email_id = msg.content.strip()
+        self.logger.debug("Received notification for email %s", email_id)
+
+        # Получаем письмо из общего mailbox
+        mailbox = get_shared_mailbox()
+        email = mailbox.get_message(email_id)
+        if not email:
+            self.logger.warning("Email %s not found in mailbox", email_id)
+            return
+
+        if self.memory:
+            # Сохраняем факт о письме в Mem0
+            try:
+                fact = f"Письмо от {email.sender} на тему '{email.subject}': {email.body}"
+                messages_for_memory = [
+                    {"role": "user", "content": f"Новое письмо: {email.subject}"},
+                    {"role": "assistant", "content": fact}
+                ]
+                # Добавляем метаданные для возможной фильтрации
+                metadata = {
+                    "email_id": email_id,
+                    "sender": email.sender,
+                    "subject": email.subject,
+                    "thread_id": email.thread_id
+                }
+                self.memory.add(messages_for_memory, user_id=self.user_id, metadata=metadata)
+                self.logger.debug("Saved fact about email %s to memory", email_id)
+            except Exception as e:
+                self.logger.warning("Failed to save email fact to memory: %s", e)
+        else:
+            if self.email_store is not None:
+                # Формируем текстовое представление письма
+                email_text = f"От: {email.sender}\nТема: {email.subject}\nТекст: {email.body}"
+                self.email_store.append(email_text)
+                self.logger.debug("Stored email %s locally", email_id)
+
+
 @configuration(MailAgentConf)
 class MailAgent(Agent, Configurable[MailAgentConf]):
     def setup(self):
+        user_id = "mail_agent_user"
         SYSTEM_PROMPT = (
             "Ты персональный почтовый помощник. "
             "Используй предоставленные инструменты для работы с почтой. "
             "Сначала получи список писем, затем при необходимости прочитай нужные письма. "
             "Отвечай на вопросы точно и кратко, опираясь на содержимое писем."
         )
+        memory = None
+        email_store = None
+        if self.config.use_memory:
+            # Инициализация памяти Mem0, если запрошено
+            if self.config.memory_config is None:
+                # ВАЖНО: подставьте правильную размерность эмбеддингов!
+                EMBEDDING_DIM = 2560  # уточните под вашу модель
+                self.config.memory_config = {
+                    "llm": {
+                        "provider": "openai",
+                        "config": {
+                            "model": self.config.model,
+                            "openai_base_url": "http://localhost:8090/v1",  # или из окружения
+                            "api_key": "dummy"
+                        }
+                    },
+                    "embedder": {
+                        "provider": "openai",
+                        "config": {
+                            "model": "EmbeddingsGigaR",  # уточните название
+                            "openai_base_url": "http://localhost:8090/v1",
+                            "api_key": "dummy",
+                            "embedding_dims": EMBEDDING_DIM
+                        }
+                    },
+                    "vector_store": {
+                        "provider": "chroma",
+                        "config": {
+                            "collection_name": "spade_test_mem0_chroma_v2",
+                            "path": "/tmp/chroma_mem0"
+                            # поле "dimension" удалено — оно не допускается в vector_store.config
+                        }
+                    }
+                }
+                memory = Memory.from_config(self.config.memory_config)
+                logger.info("Mem0 memory initialized")
+        else:
+            # Создаём локальное хранилище писем
+            email_store = []
+            logger.info("Using local email store (memory disabled)")
+
         self.add_behaviour(MailRequestBehaviour(
-            template=MessageTemplate.request(),
             system_prompt=SYSTEM_PROMPT,
             model=self.default_context.create_chat_model(self.config.model),
             max_iterations=self.config.max_iterations,
+            memory=memory,  # добавляем
+            user_id=user_id,
+            email_store=email_store  # добавляем
+        ))
+        self.add_behaviour(MailReceiveBehaviour(
+            memory=memory,
+            user_id=user_id,
+            email_store=email_store
         ))
