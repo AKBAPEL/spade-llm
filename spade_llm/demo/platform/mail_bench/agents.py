@@ -161,13 +161,13 @@ class EnvironmentAgent(Agent, Configurable[EnvironmentAgentConf]):
 
                 # Отправить вопрос mail_agent-у
                 await self.context.request("mail_agent").with_content(sq.question)
-
+                print('1111111111',sq.question[:20])
                 # Ждать ответ
                 response = await self.receive(
                     MessageTemplate(performative=consts.INFORM, thread_id=self.context.thread_id),
                     timeout=60
                 )
-
+                print('22222222222', response.content[:20])
                 actual_answer = response.content if response else "<NO RESPONSE>"
 
                 # Оценить
@@ -293,6 +293,7 @@ class MailRequestBehaviour(MessageHandlingBehavior):
                 memories_text = "\n".join(
                     f"- {m['memory']}" for m in memories.get("results", [])
                 )
+                self.logger.info("Found relevant fragments: %s", memories_text)
                 if memories_text:
                     system_prompt += f"\n\nRelevant memories:\n{memories_text}"
                     self.logger.debug("Added %d memories to prompt", len(memories["results"]))

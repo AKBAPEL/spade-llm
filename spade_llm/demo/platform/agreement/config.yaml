@@ -1,0 +1,31 @@
+# Configuration of the messaging system. For demo internal in-memory messaging is used
+messaging:
+  type_name: spade_llm.core.messaging.DictionaryMessageService
+# Configuration of the agent state storage. For demo internal in-memory storage is used
+storage:
+  type_name: spade_llm.core.storage.InMemoryStorageFactory
+# Agents to host in the system
+agents:
+  # Console agent which listens for commands from console and sends them to the delegate agent
+  first:
+    type_name: spade_llm.demo.platform.agreement.agents.FirstAgent
+  second:
+    type_name: spade_llm.demo.platform.agreement.agents.SecondAgent
+  third:
+    type_name: spade_llm.demo.platform.agreement.agents.ThirdAgent
+  fourth:
+    type_name: spade_llm.demo.platform.agreement.agents.FourthAgent
+  fifth:
+    type_name: spade_llm.demo.platform.agreement.agents.FifthAgent
+  sixth:
+    type_name: spade_llm.demo.platform.agreement.agents.SixthAgent
+  seventh:
+    type_name: spade_llm.demo.platform.agreement.agents.SeventhAgent
+  platform_agent:
+    type_name: spade_llm.demo.platform.agreement.agents.PlatformAgent
+    args:
+      model: max
+      senat_agents: [ first ]
+  communication_board:
+    type_name: spade_llm.demo.platform.agreement.agents.CommunicationBoardAgent
+wait_for_agents: [ platform_agent ]

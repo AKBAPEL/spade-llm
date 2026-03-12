@@ -1,0 +1,43 @@
+messaging:
+  type_name: spade_llm.core.messaging.DictionaryMessageService
+storage:
+  type_name: spade_llm.core.storage.InMemoryStorageFactory
+
+tools:
+  mail_toolkit:
+    type_name: spade_llm.demo.platform.mail_bench.mail_helpers.MailToolkitFactory
+    args:
+      type_name: spade_llm.demo.platform.mail_bench.mail_helpers.MailToolkit
+
+chat_models:
+  max:
+    type_name: spade_llm.models.gigachat.GigaChatModelFactory
+    args:
+      credentials: env.GIGA_CRED
+      scope: env.GIGACHAT_SCOPE
+      model: GigaChat-2-Max
+      verify_ssl_certs: False
+
+agents:
+  mail_agent:
+    type_name: spade_llm.demo.platform.mail_bench.agents.MailAgent
+    args:
+      model: max
+      max_iterations: 2
+      #use_memory: False
+      use_memory: True # либо False чтобы без Mem0
+    # tools: [ mail_toolkit ] # включать не обязательно
+
+  environment_agent:
+    type_name: spade_llm.demo.platform.mail_bench.agents.EnvironmentAgent
+    args:
+      scenario: spade_llm/demo/platform/mail_bench/scenario_example.yaml
+      model: max
+
+  console:
+    type_name: spade_llm.agents.console.ConsoleAgent
+    args:
+      delegate_type: environment_agent
+      prompt: Нажмите Enter
+      timeout: 200
+wait_for_agents: [ console ]

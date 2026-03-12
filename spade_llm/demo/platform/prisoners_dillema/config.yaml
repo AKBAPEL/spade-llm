@@ -1,0 +1,45 @@
+# Configuration of the messaging system. For demo internal in-memory messaging is used
+messaging:
+  type_name: spade_llm.core.messaging.DictionaryMessageService
+# Configuration of the agent state storage. For demo internal in-memory storage is used
+storage:
+  type_name: spade_llm.core.storage.InMemoryStorageFactory
+chat_models:
+  max:
+    type_name: spade_llm.models.gigachat.GigaChatModelFactory
+    args:
+      credentials: env.GIGA_CRED
+      scope: env.GIGACHAT_SCOPE
+      model: GigaChat-2-Max
+      verify_ssl_certs: False
+  lite:
+    type_name: spade_llm.models.gigachat.GigaChatModelFactory
+    args:
+      credentials: env.GIGA_CRED
+      scope: env.GIGACHAT_SCOPE
+      model: GigaChat
+      verify_ssl_certs: False
+# Agents to host in the system
+agents:
+  # Console agent which listens for commands from console and sends them to the delegate agent
+  first:
+    type_name: spade_llm.demo.platform.prisoners_dillema.agents.FirstAgent
+    args:
+      model: max
+  second:
+    type_name: spade_llm.demo.platform.prisoners_dillema.agents.SecondAgent
+    args:
+      model: max
+
+  platform_agent:
+    type_name: spade_llm.demo.platform.prisoners_dillema.agents.PlatformAgent
+    args:
+      model: max
+      n_rounds: 20
+  console:
+    type_name: spade_llm.agents.console.ConsoleAgent
+    args:
+      delegate_type: platform_agent
+      prompt: Нажмите Enter
+      timeout: 200
+wait_for_agents: [ console ]
