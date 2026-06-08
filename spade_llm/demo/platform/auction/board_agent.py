@@ -10,17 +10,13 @@ from spade_llm.core.agent import Agent
 from spade_llm.core.behaviors import MessageHandlingBehavior, MessageTemplate
 from spade_llm.core.conf import Configurable, configuration
 from spade_llm.demo.platform.auction.auction_behaviors import AuctionContractNetInitiatorBehavior
-from spade_llm.demo.platform.auction.merchant_agents import (
-    FirstMerchantAgent,
-    SecondMerchantAgent,
-    ThirdMerchantAgent,
-)
 from spade_llm.demo.platform.auction.models import (
     ProposalBoard,
     ProposalBoardAgentConf,
     ShopList,
     ShopListRequest,
 )
+from spade_llm.demo.platform.auction.scenario_loader import get_active_scenario
 from spade_llm.demo.platform.auction.utils import user_decision
 
 logger = logging.getLogger(__name__)
@@ -38,37 +34,30 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
         filename = f"winning_bid_split_{timestamp}.txt"
         path = os.path.join("auction_logs", filename)
 
-        # Словарь с shop_sku для каждого агента
-        agent_shop_sku = {
-            "first_merchant": FirstMerchantAgent.shop_sku,
-            "second_merchant": SecondMerchantAgent.shop_sku,
-            "third_merchant": ThirdMerchantAgent.shop_sku
-        }
+        scenario = get_active_scenario()
+        agent_shop_sku = {agent_id: cfg.sku for agent_id, cfg in scenario.agents.items()}
+
         ###################### МЕТРИКИ ######################
-        # Вычисляем общие метрики
-        total_P = sum(self.proposal_board.proposal.ingredients.values())  # Итоговая цена (P)
+        total_P = sum(self.proposal_board.proposal.ingredients.values())
         total_C = sum(
-            agent_shop_sku[agent].get(ingr, 0)
+            agent_shop_sku.get(agent, {}).get(ingr, 0)
             for agent, ingredients in self.proposal_board.bid_ingredient_split.items()
             for ingr in ingredients.keys()
-        )  # Себестоимость (C)
-        V = self.config.max_price  # Резервная цена (V)
+        )
+        V = self.config.max_price
 
-        # Защита от деления на ноль
         P_safe = total_P if total_P > 0 else 1
         C_safe = total_C if total_C > 0 else 1
 
-        # Метрика 1: (V-P)/P * (P-C)/P
         if P_safe > 0:
             metric_1 = ((V - total_P) / P_safe) * ((total_P - total_C) / P_safe)
         else:
             metric_1 = 0.0
 
-        # Метрика 2: продукт маржинальности по агентам
         agent_margins = []
         for agent, ingredients in self.proposal_board.bid_ingredient_split.items():
             P_i = sum(ingredients.values())
-            C_i = sum(agent_shop_sku[agent].get(ingr, 0) for ingr in ingredients.keys())
+            C_i = sum(agent_shop_sku.get(agent, {}).get(ingr, 0) for ingr in ingredients.keys())
             margin_i = (P_i - C_i) / (C_i if C_i > 0 else 1)
             agent_margins.append(margin_i)
 
@@ -89,15 +78,12 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 f.write(f"Agent [{agent}] (Ingredients):\n")
                 f.write(json.dumps(ingredients, ensure_ascii=False, indent=2) + "\n")
 
-                # Подсчет суммы за ингредиенты в заказе
                 order_sum = sum(ingredients.values())
                 f.write(f"Total sum for ingredients in order: {order_sum}\n")
 
-                # Подсчет суммы за те же ингредиенты в shop_sku агента
-                shop_sum = sum(agent_shop_sku[agent].get(ingr, 0) for ingr in ingredients.keys())
+                shop_sum = sum(agent_shop_sku.get(agent, {}).get(ingr, 0) for ingr in ingredients.keys())
                 f.write(f"Total sum for these ingredients in shop_sku: {shop_sum}\n")
 
-                # Расчет маржи в процентах
                 margin = ((order_sum - shop_sum) / shop_sum * 100) if shop_sum > 0 else 0
                 f.write(f"Margin: {margin:.2f}%\n")
                 f.write("\n")
@@ -106,16 +92,13 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
         logger.info("Saved winning bid_ingredient_split to %s", path)
 
     class InitialRequestBehaviour(MessageHandlingBehavior):
-        ingredients = [
-            "мясо (говядина)", "свёкла", "морковь", "лук репчатый",
-            "капуста белокочанная", "картофель", "томатная паста", "чеснок",
-            "уксус (лимонный сок)", "лавровый лист", "соль, перец",
-            "зелень (укроп/петрушка)", "сметана"
-        ]
 
         def __init__(self, config: ProposalBoardAgentConf):
             super().__init__(MessageTemplate.request())
             self.config = config
+            scenario = get_active_scenario()
+            self.ingredients = scenario.user_request
+            self.scenario_max_price = scenario.max_price
 
         async def _run_auction_rounds(self) -> None:
             """Запускает серию раундов аукциона с отслеживанием стабильности"""
@@ -129,7 +112,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 request = AuctionContractNetInitiatorBehavior(
                     task=self.agent.proposal_board.sku_request,
                     context=self.context,
-                    time_to_wait_for_proposals=20
+                    time_to_wait_for_proposals=30
                 )
 
                 self.agent.proposal_board.round_number = round_number
@@ -160,10 +143,6 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                     break
 
         async def _evaluate_results(self, msg) -> bool:
-            """
-            Проверяет итоги аукциона.
-            Возвращает True, если нужно запустить повторный аукцион (например, если цена выше лимита).
-            """
             board = self.agent.proposal_board
             requested = set(board.sku_request.ingredients)
             proposed = set(board.proposal.ingredients.keys())
@@ -175,8 +154,6 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 )
                 return False
 
-            # Тут мы понимаем что все ингредиенты собраны
-
             total_price = sum(board.proposal.ingredients.values())
             limit = self.config.max_price
 
@@ -186,7 +163,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                     f"Все ингредиенты найдены. Общая цена: {total_price}"
                 )
                 self.agent._save_winning_bid_split()
-                return False  # повтор не нужен
+                return False
             else:
                 if board.user_wants_lower_than is None:
                     board.user_wants_lower_than = total_price
@@ -200,7 +177,7 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 board.proposal = ShopList()
                 board.agents.clear()
                 board.bid_ingredient_split.clear()
-                return True  # нужен повтор
+                return True
 
         async def step(self) -> None:
             """Run the auction process for the requested ingredients"""
@@ -219,7 +196,6 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                     await self.context.reply_with_failure(msg).with_content(
                         f"Не удалось предложить подходящую цену."
                     )
-                # self.set_is_done()
 
     class RequestInfoBehaviour(MessageHandlingBehavior):
         def __init__(self, config: ProposalBoardAgentConf):
@@ -228,12 +204,14 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
 
         async def step(self):
             """Reply with the current state of the proposal board"""
-            # await asyncio.sleep(5) # ошибка в том что если два сообщения одновременно приходят то обрабатывается только одно
             msg = self.message
             if msg:
                 await self.context.reply_with_inform(msg).with_content(self.agent.proposal_board)
 
     def setup(self):
         """Initialize agent behaviors"""
+        scenario = get_active_scenario()
+        self.config.max_price = scenario.max_price
+        logger.info("ProposalBoardAgent loaded scenario '%s', max_price set to %d", scenario.name, scenario.max_price)
         self.add_behaviour(self.InitialRequestBehaviour(self.config))
         self.add_behaviour(self.RequestInfoBehaviour(self.config))

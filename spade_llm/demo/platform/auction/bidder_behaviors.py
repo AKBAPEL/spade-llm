@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 import re
 from typing import Optional
 
@@ -17,6 +18,7 @@ from spade_llm.demo.platform.auction.models import (
     ProposalBoard,
     ShopList,
 )
+from spade_llm.demo.platform.auction.scenario_loader import get_active_scenario
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +101,7 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         await asyncio.sleep(self.config.bid_delay)
         await self.context.acknowledge('proposal_board').with_content('')
         response = await self.receive(
-            template=MessageTemplate(thread_id=self.context.thread_id, performative=consts.INFORM), timeout=15)
+            template=MessageTemplate(thread_id=self.context.thread_id, performative=consts.INFORM), timeout=60)
         if not response:
             logger.error("No info about auction board after 15 seconds")
             return None
@@ -109,9 +111,11 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         """Build trust context string from agent's trust memory for available partners."""
         if not getattr(self.agent.config, 'enable_trust_mechanism', False):
             return ""
+        scenario = get_active_scenario()
+        all_agents = list(scenario.agents.keys())
         lines = ["Твои прошлые впечатления о партнёрах (от новых к старым):"]
         has_any = False
-        for partner in ["first_merchant", "second_merchant", "third_merchant"]:
+        for partner in all_agents:
             if partner == self.context.agent_type:
                 continue
             records = self.agent.trust_memory.get(partner, [])
@@ -129,7 +133,10 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
         """Update the agent's current bid based on the board state"""
         current_board = await self.get_current_board()
         if self.context.agent_type not in current_board.agents:
-            agents_able = [a for a in ["first_merchant", "second_merchant"] if a != self.context.agent_type]
+            scenario = get_active_scenario()
+            all_agents = list(scenario.agents.keys())
+            agents_able = [a for a in all_agents if a != self.context.agent_type]
+            random.shuffle(agents_able)
             trust_context = self._build_trust_context()
             chain = self.bidder_prompt | self.model
             await asyncio.sleep(self.config.bid_delay)
@@ -200,7 +207,7 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
             my_bid = await self.get_my_bid()
             await asyncio.sleep(self.config.bid_delay)
             await self.context.reply_with_propose(msg).with_content(my_bid)
-            response = await self.receive(MessageTemplate(thread_id=self.context.thread_id), timeout=15)
+            response = await self.receive(MessageTemplate(thread_id=self.context.thread_id), timeout=30)
             if response is None:
                 logger.warning("No response received from %s to bidder %s", msg.sender, self.context.agent_type)
             elif response.content == 'UPDATING':

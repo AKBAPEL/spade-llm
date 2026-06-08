@@ -18,7 +18,7 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
     time_to_wait_for_proposals: float
     _started_at: float
 
-    def __init__(self, task: ShopListRequest, context, time_to_wait_for_proposals: float = 10):
+    def __init__(self, task: ShopListRequest, context, time_to_wait_for_proposals: float = 30):
         super().__init__(context)
         self.time_to_wait_for_proposals = time_to_wait_for_proposals
         self.task = task

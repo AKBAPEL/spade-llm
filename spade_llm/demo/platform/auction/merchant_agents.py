@@ -1,5 +1,4 @@
 import asyncio
-import glob
 import json
 import logging
 import os
@@ -12,10 +11,14 @@ from pydantic import BaseModel, Field
 from spade_llm.core.agent import Agent
 from spade_llm.core.behaviors import MessageHandlingBehavior
 from spade_llm.core.conf import Configurable, configuration
-from spade_llm.demo.platform.auction.agent_prompts import TRUST_IMPRESSION_PROMPT
+from spade_llm.demo.platform.auction.agent_prompts import (
+    AGGRESSIVE_RESPONDER_PROMPT,
+    TRUST_IMPRESSION_PROMPT,
+)
 from spade_llm.demo.platform.auction.bidder_behaviors import AuctionBidderBehaviour
 from spade_llm.demo.platform.auction.dialogue_behaviors import DialogueResponderBehaviour
 from spade_llm.demo.platform.auction.models import AuctionProposal, TrustImpressionRecord
+from spade_llm.demo.platform.auction.scenario_loader import get_active_scenario
 from spade_llm.demo.platform.contractnet.discovery import AgentDescription, AgentTask, DF_ADDRESS
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,20 @@ class ThirdMerchantAgentConf(BaseModel):
     trust_preload_from_dialogues: bool = Field(default=False, description="Preload trust impressions from existing dialogue files")
 
 
+class FourthMerchantAgentConf(BaseModel):
+    model: str = Field(description="Model name")
+    bid_delay: float = Field(default=1, description="Delay between bids")
+    enable_trust_mechanism: bool = Field(default=False, description="Enable trust memory and LLM-based impressions")
+    trust_preload_from_dialogues: bool = Field(default=False, description="Preload trust impressions from existing dialogue files")
+
+
+class FifthMerchantAgentConf(BaseModel):
+    model: str = Field(description="Model name")
+    bid_delay: float = Field(default=1, description="Delay between bids")
+    enable_trust_mechanism: bool = Field(default=False, description="Enable trust memory and LLM-based impressions")
+    trust_preload_from_dialogues: bool = Field(default=False, description="Preload trust impressions from existing dialogue files")
+
+
 class BaseMerchantAgent(Agent):
     """Base class for merchant agents with common auction logic."""
 
@@ -49,6 +66,7 @@ class BaseMerchantAgent(Agent):
     _agent_id: str = "base_merchant"
     _agent_description: str = "Агент-магазин который участвует в аукционе"
     _register_delay: float = 2.0
+    _responder_prompt = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -59,6 +77,15 @@ class BaseMerchantAgent(Agent):
 
     def setup(self):
         """Initialize agent with auction and dialogue behaviors"""
+        scenario = get_active_scenario()
+        agent_cfg = scenario.agents.get(self._agent_id)
+        if agent_cfg:
+            self.shop_sku = agent_cfg.sku
+            logger.info("Loaded SKU for %s from scenario: %d items", self._agent_id, len(self.shop_sku))
+        else:
+            logger.warning("No scenario config found for %s, using empty SKU", self._agent_id)
+            self.shop_sku = {}
+
         asyncio.create_task(self.register_in_df())
         model = self.default_context.create_chat_model(self.config.model)
         self.add_behaviour(AuctionBidderBehaviour(
@@ -67,7 +94,8 @@ class BaseMerchantAgent(Agent):
         ))
         self.add_behaviour(DialogueResponderBehaviour(
             config=self.config,
-            model=model
+            model=model,
+            prompt=self._responder_prompt,
         ))
         self.load_trust_memory()
 
@@ -81,7 +109,6 @@ class BaseMerchantAgent(Agent):
                 migrated: Dict[str, List[TrustImpressionRecord]] = {}
                 for partner, records in raw.items():
                     if isinstance(records, str):
-                        # legacy single-string migration
                         migrated[partner] = [
                             TrustImpressionRecord(
                                 timestamp=datetime.now().isoformat(),
@@ -168,21 +195,6 @@ class BaseMerchantAgent(Agent):
 @configuration(FirstMerchantAgentConf)
 class FirstMerchantAgent(BaseMerchantAgent, Configurable[FirstMerchantAgentConf]):
     """Agent representing the first merchant in the auction"""
-    shop_sku = {
-        "мясо (говядина)": 350,
-        "свёкла": 50,
-        "морковь": 35,
-        "лук репчатый": 25,
-        "капуста белокочанная": 85,
-        "картофель": 45,
-        "томатная паста": 40,
-        "чеснок": 20,
-        "уксус (лимонный сок)": 10,
-        "лавровый лист": 5,
-        "соль, перец": 10,
-        "зелень (укроп/петрушка)": 30,
-        # "сметана" : 60
-    }
     _agent_id = "first_merchant"
     _register_delay = 2.0
 
@@ -190,19 +202,6 @@ class FirstMerchantAgent(BaseMerchantAgent, Configurable[FirstMerchantAgentConf]
 @configuration(SecondMerchantAgentConf)
 class SecondMerchantAgent(BaseMerchantAgent, Configurable[SecondMerchantAgentConf]):
     """Agent representing the second merchant in the auction"""
-    shop_sku = {
-        "мясо (говядина)": 320,
-        "морковь": 30,
-        "лук репчатый": 20,
-        "капуста белокочанная": 80,
-        "картофель": 40,
-        "томатная паста": 35,
-        "чеснок": 15,
-        "лавровый лист": 5,
-        "соль, перец": 10,
-        "зелень (укроп/петрушка)": 25,
-        "сметана": 60
-    }
     _agent_id = "second_merchant"
     _register_delay = 3.0
 
@@ -210,20 +209,20 @@ class SecondMerchantAgent(BaseMerchantAgent, Configurable[SecondMerchantAgentCon
 @configuration(ThirdMerchantAgentConf)
 class ThirdMerchantAgent(BaseMerchantAgent, Configurable[ThirdMerchantAgentConf]):
     """Agent representing the 3 merchant in the auction"""
-    shop_sku = {
-        # "мясо (говядина)": 550,
-        "морковь": 30,
-        "лук репчатый": 20,
-        "капуста белокочанная": 80,
-        "картофель": 40,
-        "свёкла": 10,
-        "уксус (лимонный сок)": 90,
-        "томатная паста": 35,
-        "чеснок": 15,
-        "лавровый лист": 5,
-        "соль, перец": 10,
-        "зелень (укроп/петрушка)": 25,
-        "сметана": 60
-    }
     _agent_id = "third_merchant"
+    _register_delay = 3.0
+
+
+@configuration(FourthMerchantAgentConf)
+class FourthMerchantAgent(BaseMerchantAgent, Configurable[FourthMerchantAgentConf]):
+    """Agent representing the 4th merchant — aggressive, unreliable partner."""
+    _agent_id = "fourth_merchant"
+    _register_delay = 3.0
+    _responder_prompt = AGGRESSIVE_RESPONDER_PROMPT
+
+
+@configuration(FifthMerchantAgentConf)
+class FifthMerchantAgent(BaseMerchantAgent, Configurable[FifthMerchantAgentConf]):
+    """Agent representing the 5th merchant in the auction"""
+    _agent_id = "fifth_merchant"
     _register_delay = 3.0

@@ -306,7 +306,7 @@ class StartDialogueBehaviour(ContextBehaviour):
             # ожидание ответа (ACKNOWLEDGE или REFUSE)
             response = await self.receive(
                 template=MessageTemplate(thread_id=thread.thread_id),
-                timeout=60
+                timeout=120
             )
             if not response:
                 logger.warning("No response from %s", self.contragent)
@@ -428,14 +428,14 @@ class StartDialogueBehaviour(ContextBehaviour):
 class DialogueResponderBehaviour(MessageHandlingBehavior):
     """Behavior for responding to dialogue requests from other merchants"""
 
-    def __init__(self, config, model: BaseChatModel):
+    def __init__(self, config, model: BaseChatModel, prompt=None):
         super().__init__(MessageTemplate.request())
         self.config = config
         self.model = model
         self.parser = PydanticOutputParser(pydantic_object=Act)
         self.conversation_history = dict()
         self.full_conversation_history: Dict[str, List[str]] = {}
-        self.merchant_prompt = DIALOGUE_RESPONDER_PROMPT
+        self.merchant_prompt = prompt or DIALOGUE_RESPONDER_PROMPT
         self.user_requests: Dict[str, ShopListRequest] = {}  # conversation_id -> запрос
         self._negotiation_decisions: Dict[str, NegotiationResponse] = {}  # conversation_id -> решение о переговорах
 

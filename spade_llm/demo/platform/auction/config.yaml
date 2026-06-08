@@ -4,6 +4,8 @@ messaging:
 # Configuration of the agent state storage. For demo internal in-memory storage is used
 storage:
   type_name: spade_llm.core.storage.InMemoryStorageFactory
+# Active scenario for the auction (scenario_a, scenario_b, or scenario_c)
+scenario: scenario_a
 chat_models:
   max:
     type_name: spade_llm.models.gigachat.GigaChatModelFactory
@@ -31,10 +33,21 @@ agents:
     args:
       model: max
       enable_trust_mechanism: true
-#  third_merchant:
-#    type_name: spade_llm.demo.platform.auction.agents.ThirdMerchantAgent
-#    args:
-#      model: max
+  third_merchant:
+    type_name: spade_llm.demo.platform.auction.agents.ThirdMerchantAgent
+    args:
+      model: max
+      enable_trust_mechanism: true
+  fourth_merchant:
+    type_name: spade_llm.demo.platform.auction.agents.FourthMerchantAgent
+    args:
+      model: max
+      enable_trust_mechanism: true
+  fifth_merchant:
+    type_name: spade_llm.demo.platform.auction.agents.FifthMerchantAgent
+    args:
+      model: max
+      enable_trust_mechanism: true
   # Console agent which listens for commands from console and sends them to the delegate agent
   console:
     type_name: spade_llm.agents.console.ConsoleAgent
