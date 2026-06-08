@@ -137,6 +137,20 @@ JSON only, without Markdown and additional text.
 БЕЗ Markdown!!! 
 НЕ добавляй лишние уровни вроде {{"decision": {{"CollaborationProposal": {{...}}}}}}. 
 Для вывода ShopList: {{"decision": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}} 
-Для вывода CollaborationProposal: {{"decision": {{"target_agent": "имя_агента", "needed_ingredients": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}}}}
+Для вывода CollaborationProposal: {{"decision": {{"target_agent": "имя_агента", "needed_ingredients": {{"ingredients": {{"ингредиент1": цена1, "ингредиент2": цена2}}}}}}}}}}
+"""
+)
+
+
+NEGOTIATION_DECISION_PROMPT = ChatPromptTemplate.from_template(
+    """Тебе предлагают вступить в переговоры с агентом {sender_id}.
+
+Твой ассортимент и цены:
+{shop_sku}
+
+Хочешь ли вступить в переговоры с агентом {sender_id}?
+Ответь кратко: согласен или нет, с однопредложенным обоснованием.
+
+{format_instructions}
 """
 )
