@@ -16,6 +16,7 @@ from spade_llm.demo.platform.auction.agent_prompts import (
     DIALOGUE_INITIATOR_PROMPT,
     DIALOGUE_RESPONDER_PROMPT,
     NEGOTIATION_DECISION_PROMPT,
+    TRUST_IMPRESSION_PROMPT,
 )
 from spade_llm.demo.platform.auction.models import (
     Act,
@@ -48,6 +49,7 @@ class StartDialogueBehaviour(ContextBehaviour):
         self.initiator_prompt = DIALOGUE_INITIATOR_PROMPT
         self.user_request = user_request
         self.user_max_price = user_max_price
+        self._dialogue_outcome = "incomplete"
 
     # -----------------------
     # JSON УТИЛИТЫ
@@ -161,6 +163,26 @@ class StartDialogueBehaviour(ContextBehaviour):
                     f.write(f"ParseError: {entry}\n")
 
         logger.info("Saved dialogue to %s", path)
+
+    async def _generate_and_save_impression(self):
+        """Generate trust impression about contragent via LLM and persist it."""
+        if not getattr(self.agent.config, 'enable_trust_mechanism', False):
+            return
+        try:
+            chain = TRUST_IMPRESSION_PROMPT | self.model
+            answer = await chain.ainvoke({
+                "conversation_history": "\n".join(self.full_conversation_history),
+                "agent_role": self.context.agent_type,
+                "partner_id": self.contragent,
+                "outcome": self._dialogue_outcome,
+            })
+            impression = answer.content.strip()
+            if impression:
+                self.agent.add_trust_impression(self.contragent, impression, self._dialogue_outcome, source="runtime")
+                self.agent.save_trust_memory()
+                logger.info("Saved trust impression for %s about %s: %s", self.context.agent_type, self.contragent, impression[:120])
+        except Exception as e:
+            logger.warning("Failed to generate trust impression for %s about %s: %s", self.context.agent_type, self.contragent, e)
 
     # -----------------------
     # ГЛАВНАЯ ЛОГИКА
@@ -278,6 +300,7 @@ class StartDialogueBehaviour(ContextBehaviour):
                 await thread.request(self.contragent).with_content(json.dumps(message_data))
             else:
                 logger.warning("Unexpected offer type: %s", type(current_offer))
+                self._dialogue_outcome = "error"
                 break
 
             # ожидание ответа (ACKNOWLEDGE или REFUSE)
@@ -287,14 +310,17 @@ class StartDialogueBehaviour(ContextBehaviour):
             )
             if not response:
                 logger.warning("No response from %s", self.contragent)
+                self._dialogue_outcome = "timeout"
                 break
 
             if response.performative == consts.REFUSE:
                 logger.info("Contragent %s refused negotiation. Reason: %s", self.contragent, response.content)
+                self._dialogue_outcome = "refused"
                 break
 
             if response.performative != consts.ACKNOWLEDGE:
                 logger.warning("Unexpected performative from %s: %s", self.contragent, response.performative)
+                self._dialogue_outcome = "error"
                 break
 
             # попытка распарсить ответ
@@ -303,6 +329,7 @@ class StartDialogueBehaviour(ContextBehaviour):
 
             if not data:
                 logger.error("Empty or invalid response JSON from %s: %s", self.contragent, response.content)
+                self._dialogue_outcome = "error"
                 break
 
             competitor_msg = None
@@ -323,6 +350,7 @@ class StartDialogueBehaviour(ContextBehaviour):
 
             if competitor_msg is None:
                 logger.error("Unrecognized message from %s: %s", self.contragent, data)
+                self._dialogue_outcome = "error"
                 break
 
             self._update_history("Opponent", competitor_msg)
@@ -359,6 +387,7 @@ class StartDialogueBehaviour(ContextBehaviour):
                     }
                 )
                 print("BID UPDATED COLLABORATION")
+                self._dialogue_outcome = "success"
                 break
 
             # если получили Conversate — продолжаем торг
@@ -367,6 +396,7 @@ class StartDialogueBehaviour(ContextBehaviour):
                     logger.error('NONE 6')
                 if len(self.full_conversation_history) >= 20:
                     logger.info("Dialogue round limit reached (10 rounds / 20 messages), auto-terminating")
+                    self._dialogue_outcome = "round_limit"
                     break
                 act = await self.process_response({
                     "type": msg_type,
@@ -384,12 +414,14 @@ class StartDialogueBehaviour(ContextBehaviour):
                     await thread.acknowledge(self.contragent).with_content(json.dumps(response_data))
                 else:
                     logger.warning("Unexpected action type: %s", type(act.action))
+                    self._dialogue_outcome = "error"
                     break
 
             iteration += 1
 
         await thread.close()
         self._save_dialogue()
+        await self._generate_and_save_impression()
         self.set_is_done()
 
 
@@ -490,10 +522,16 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
     async def _should_negotiate(self, sender_id: str) -> NegotiationResponse:
         """Спрашивает LLM, хочет ли агент вступить в переговоры с отправителем."""
         parser = PydanticOutputParser(pydantic_object=NegotiationResponse)
+        impression = "Прошлого опыта взаимодействия нет. Это первая встреча."
+        if getattr(self.agent.config, 'enable_trust_mechanism', False):
+            latest = self.agent.get_latest_impression(sender_id)
+            if latest:
+                impression = latest
         chain = NEGOTIATION_DECISION_PROMPT | self.model
         answer = await chain.ainvoke({
             "sender_id": sender_id,
             "shop_sku": self.agent.shop_sku,
+            "impression": impression,
             "format_instructions": parser.get_format_instructions()
         })
         cleaned = self.clean_json(answer.content)
@@ -503,6 +541,27 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         except Exception as e:
             logger.error("Error parsing negotiation response: %s", e)
             return NegotiationResponse(agree=True, reason="Ошибка парсинга, соглашаемся по умолчанию")
+
+    async def _generate_and_save_impression_responder(self, partner_id: str, conversation_id: str, outcome: str):
+        """Generate trust impression about partner via LLM and persist it."""
+        if not getattr(self.agent.config, 'enable_trust_mechanism', False):
+            return
+        try:
+            history = self.full_conversation_history.get(conversation_id, [])
+            chain = TRUST_IMPRESSION_PROMPT | self.model
+            answer = await chain.ainvoke({
+                "conversation_history": "\n".join(history),
+                "agent_role": self.context.agent_type,
+                "partner_id": partner_id,
+                "outcome": outcome,
+            })
+            impression = answer.content.strip()
+            if impression:
+                self.agent.add_trust_impression(partner_id, impression, outcome, source="runtime")
+                self.agent.save_trust_memory()
+                logger.info("Saved trust impression for %s about %s: %s", self.context.agent_type, partner_id, impression[:120])
+        except Exception as e:
+            logger.warning("Failed to generate trust impression for %s about %s: %s", self.context.agent_type, partner_id, e)
 
     # -----------------------
     # ГЛАВНАЯ ЛОГИКА
@@ -545,6 +604,7 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
                     self.context.agent_type, msg.sender.agent_type, negotiation_decision.reason
                 )
                 await self.context.reply_with_refuse(msg).with_content(negotiation_decision.reason)
+                await self._generate_and_save_impression_responder(msg.sender.agent_type, conversation_id, "refused")
                 return
             else:
                 logger.info(
@@ -587,6 +647,7 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         if len(self.full_conversation_history[conversation_id]) >= 20:
             logger.info("Dialogue round limit reached for %s, refusing further negotiation", conversation_id)
             await self.context.reply_with_refuse(msg).with_content("Достигнут лимит раундов переговоров")
+            await self._generate_and_save_impression_responder(msg.sender.agent_type, conversation_id, "round_limit")
             return
 
         if current_interaction is None:
@@ -606,6 +667,8 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             await self.context.reply_with_acknowledge(msg).with_content(
                 act.action.model_dump_json()
             )
+            await self._generate_and_save_impression_responder(msg.sender.agent_type, conversation_id, "success")
+            return
         elif isinstance(act.action, Conversate):
             await self.context.reply_with_acknowledge(msg).with_content(
                 act.action.model_dump_json()
@@ -614,3 +677,4 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             await self.context.reply_with_refuse(msg).with_content(
                 "Unexpected action type"
             )
+            await self._generate_and_save_impression_responder(msg.sender.agent_type, conversation_id, "error")

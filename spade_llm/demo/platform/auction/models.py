@@ -89,3 +89,11 @@ class NegotiationResponse(BaseModel):
     """Response to a negotiation invitation."""
     agree: bool = Field(description="Согласен ли вступить в переговоры")
     reason: str = Field(description="Причина решения", default="")
+
+
+class TrustImpressionRecord(BaseModel):
+    """Single trust impression record with timestamp and metadata."""
+    timestamp: str = Field(description="ISO timestamp of the impression")
+    impression: str = Field(description="The impression text")
+    outcome: str = Field(description="Outcome of the dialogue: success, refused, round_limit, error, timeout, unknown/preload")
+    source: str = Field(description="Source of the impression: runtime, preload")

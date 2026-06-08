@@ -1,15 +1,21 @@
 import asyncio
+import glob
+import json
 import logging
-from typing import List, Optional
+import os
+from datetime import datetime
+from typing import Dict, List, Optional
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel, Field
 
 from spade_llm.core.agent import Agent
 from spade_llm.core.behaviors import MessageHandlingBehavior
 from spade_llm.core.conf import Configurable, configuration
+from spade_llm.demo.platform.auction.agent_prompts import TRUST_IMPRESSION_PROMPT
 from spade_llm.demo.platform.auction.bidder_behaviors import AuctionBidderBehaviour
 from spade_llm.demo.platform.auction.dialogue_behaviors import DialogueResponderBehaviour
-from spade_llm.demo.platform.auction.models import AuctionProposal
+from spade_llm.demo.platform.auction.models import AuctionProposal, TrustImpressionRecord
 from spade_llm.demo.platform.contractnet.discovery import AgentDescription, AgentTask, DF_ADDRESS
 
 logger = logging.getLogger(__name__)
@@ -18,16 +24,22 @@ logger = logging.getLogger(__name__)
 class FirstMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
     bid_delay: float = Field(default=0, description="Delay between bids")
+    enable_trust_mechanism: bool = Field(default=False, description="Enable trust memory and LLM-based impressions")
+    trust_preload_from_dialogues: bool = Field(default=False, description="Preload trust impressions from existing dialogue files")
 
 
 class SecondMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
     bid_delay: float = Field(default=1, description="Delay between bids")
+    enable_trust_mechanism: bool = Field(default=False, description="Enable trust memory and LLM-based impressions")
+    trust_preload_from_dialogues: bool = Field(default=False, description="Preload trust impressions from existing dialogue files")
 
 
 class ThirdMerchantAgentConf(BaseModel):
     model: str = Field(description="Model name")
     bid_delay: float = Field(default=1, description="Delay between bids")
+    enable_trust_mechanism: bool = Field(default=False, description="Enable trust memory and LLM-based impressions")
+    trust_preload_from_dialogues: bool = Field(default=False, description="Preload trust impressions from existing dialogue files")
 
 
 class BaseMerchantAgent(Agent):
@@ -42,18 +54,92 @@ class BaseMerchantAgent(Agent):
         super().__init__(*args, **kwargs)
         self.current_bid: Optional[AuctionProposal] = None
         self.collaborators: Optional[List[str]] = None
+        self.trust_memory: Dict[str, List[TrustImpressionRecord]] = {}
+        self._trust_memory_path = f"data/memory/{self._agent_id}_trust_memory.json"
 
     def setup(self):
         """Initialize agent with auction and dialogue behaviors"""
         asyncio.create_task(self.register_in_df())
+        model = self.default_context.create_chat_model(self.config.model)
         self.add_behaviour(AuctionBidderBehaviour(
             config=self.config,
-            model=self.default_context.create_chat_model(self.config.model)
+            model=model
         ))
         self.add_behaviour(DialogueResponderBehaviour(
             config=self.config,
-            model=self.default_context.create_chat_model(self.config.model)
+            model=model
         ))
+        self.load_trust_memory()
+
+    def load_trust_memory(self):
+        """Load trust memory from disk. Creates empty dict if file missing or corrupt.
+        Migrates legacy flat string format to structured record list."""
+        try:
+            if os.path.exists(self._trust_memory_path):
+                with open(self._trust_memory_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                migrated: Dict[str, List[TrustImpressionRecord]] = {}
+                for partner, records in raw.items():
+                    if isinstance(records, str):
+                        # legacy single-string migration
+                        migrated[partner] = [
+                            TrustImpressionRecord(
+                                timestamp=datetime.now().isoformat(),
+                                impression=records,
+                                outcome="unknown",
+                                source="legacy"
+                            )
+                        ]
+                    elif isinstance(records, list):
+                        migrated[partner] = [
+                            TrustImpressionRecord.model_validate(r) for r in records
+                        ]
+                    else:
+                        migrated[partner] = []
+                self.trust_memory = migrated
+                total = sum(len(v) for v in self.trust_memory.values())
+                logger.info("Loaded trust memory for %s: %d partners, %d total records", self._agent_id, len(self.trust_memory), total)
+            else:
+                self.trust_memory = {}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to load trust memory for %s: %s. Starting fresh.", self._agent_id, e)
+            self.trust_memory = {}
+
+    def save_trust_memory(self):
+        """Save trust memory to disk atomically."""
+        try:
+            os.makedirs(os.path.dirname(self._trust_memory_path), exist_ok=True)
+            tmp_path = self._trust_memory_path + ".tmp"
+            serializable = {
+                partner: [r.model_dump() for r in records]
+                for partner, records in self.trust_memory.items()
+            }
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._trust_memory_path)
+            total = sum(len(v) for v in self.trust_memory.values())
+            logger.info("Saved trust memory for %s: %d partners, %d total records", self._agent_id, len(self.trust_memory), total)
+        except OSError as e:
+            logger.warning("Failed to save trust memory for %s: %s", self._agent_id, e)
+
+    def add_trust_impression(self, partner_id: str, impression: str, outcome: str, source: str = "runtime"):
+        """Append a new trust impression record for a partner."""
+        record = TrustImpressionRecord(
+            timestamp=datetime.now().isoformat(),
+            impression=impression,
+            outcome=outcome,
+            source=source,
+        )
+        if partner_id not in self.trust_memory:
+            self.trust_memory[partner_id] = []
+        self.trust_memory[partner_id].append(record)
+
+    def get_latest_impression(self, partner_id: str) -> Optional[str]:
+        """Return the latest impression text for a partner, or None."""
+        records = self.trust_memory.get(partner_id, [])
+        if not records:
+            return None
+        return records[-1].impression
 
     async def register_in_df(self):
         """Register the agent in the directory facilitator"""

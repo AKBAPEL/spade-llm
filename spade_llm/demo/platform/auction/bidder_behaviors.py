@@ -105,11 +105,32 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
             return None
         return ProposalBoard.model_validate_json(response.content)
 
+    def _build_trust_context(self) -> str:
+        """Build trust context string from agent's trust memory for available partners."""
+        if not getattr(self.agent.config, 'enable_trust_mechanism', False):
+            return ""
+        lines = ["Твои прошлые впечатления о партнёрах (от новых к старым):"]
+        has_any = False
+        for partner in ["first_merchant", "second_merchant", "third_merchant"]:
+            if partner == self.context.agent_type:
+                continue
+            records = self.agent.trust_memory.get(partner, [])
+            if records:
+                latest = records[-1]
+                lines.append(f"- {partner} ({latest.timestamp}): {latest.impression}")
+                has_any = True
+            else:
+                lines.append(f"- {partner}: Прошлого опыта взаимодействия нет. Это первая встреча.")
+        if not has_any:
+            return "Прошлого опыта взаимодействия ни с одним агентом нет. Все партнёры равнозначны."
+        return "\n".join(lines)
+
     async def update_my_bid(self):
         """Update the agent's current bid based on the board state"""
         current_board = await self.get_current_board()
         if self.context.agent_type not in current_board.agents:
             agents_able = [a for a in ["first_merchant", "second_merchant"] if a != self.context.agent_type]
+            trust_context = self._build_trust_context()
             chain = self.bidder_prompt | self.model
             await asyncio.sleep(self.config.bid_delay)
             answer = await chain.ainvoke({
@@ -117,7 +138,8 @@ class AuctionBidderBehaviour(MessageHandlingBehavior):
                 "current_board": current_board,
                 "format_instructions": self.decision_parser.get_format_instructions(),
                 "agents_able_to_conversate": agents_able,
-                "user_max_price": current_board.user_wants_lower_than
+                "user_max_price": current_board.user_wants_lower_than,
+                "trust_context": trust_context,
             })
 
             try:
