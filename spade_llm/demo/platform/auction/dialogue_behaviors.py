@@ -365,6 +365,9 @@ class StartDialogueBehaviour(ContextBehaviour):
             elif isinstance(competitor_msg, Conversate):
                 if competitor_msg is None:
                     logger.error('NONE 6')
+                if len(self.full_conversation_history) >= 20:
+                    logger.info("Dialogue round limit reached (10 rounds / 20 messages), auto-terminating")
+                    break
                 act = await self.process_response({
                     "type": msg_type,
                     "data": competitor_msg.model_dump(),
@@ -580,6 +583,12 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
                 "Invalid request format: missing required fields")
 
         self._update_history("Opponent", str(current_interaction), conversation_id)
+
+        if len(self.full_conversation_history[conversation_id]) >= 20:
+            logger.info("Dialogue round limit reached for %s, refusing further negotiation", conversation_id)
+            await self.context.reply_with_refuse(msg).with_content("Достигнут лимит раундов переговоров")
+            return
+
         if current_interaction is None:
             logger.error('NONE 9')
         act = await self.process_interaction(
