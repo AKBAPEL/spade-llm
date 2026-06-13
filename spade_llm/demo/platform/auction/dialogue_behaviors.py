@@ -130,11 +130,13 @@ class StartDialogueBehaviour(ContextBehaviour):
             self.conversation_history.pop(0)
 
     def _save_dialogue(self):
-        """Сохраняет историю диалога в файл"""
+        """Сохраняет историю диалога в файл с указанием ролей и итогового статуса"""
         os.makedirs("dialogues", exist_ok=True)
         timestamp = datetime.now().strftime("%d-%H-%M-%S-%f")
         filename = f"dialogue_start_{timestamp}.txt"
         path = os.path.join("dialogues", filename)
+
+        outcome_text = self._outcome_message(self._dialogue_outcome)
 
         def parse_saved(content: str):
             try:
@@ -151,8 +153,9 @@ class StartDialogueBehaviour(ContextBehaviour):
             f.write(f"=== Dialogue log started at {timestamp} ===\n")
             f.write(f"Initiator agent: {self.context.agent_type}\n")
             f.write(f"Contragent agent: {self.contragent}\n")
+            f.write(f"Roles: {self.context.agent_type} = покупатель (инициатор), {self.contragent} = продавец (контрагент)\n")
             f.write("=========================================\n\n")
-            for entry in self.full_conversation_history:
+            for idx, entry in enumerate(self.full_conversation_history):
                 try:
                     role, content = entry.split(": ", 1)
                     msg_type, display = parse_saved(content)
@@ -162,11 +165,31 @@ class StartDialogueBehaviour(ContextBehaviour):
                     else:
                         agent_type = self.contragent
 
+                    # Первое сообщение инициатора — это запрос покупателя
+                    if idx == 0 and role.lower() == "self" and msg_type == "ShopList":
+                        msg_type = "ShopList / покупатель запрашивает"
+                    elif msg_type == "ShopList" and role.lower() == "opponent":
+                        msg_type = "ShopList / продавец соглашается"
+
                     f.write(f"{role} [{agent_type}] ({msg_type}): {display}\n")
                 except Exception:
                     f.write(f"ParseError: {entry}\n")
 
+            f.write(f"\n=== Outcome: {outcome_text} ===\n")
+
         logger.info("Saved dialogue to %s", path)
+
+    def _outcome_message(self, outcome: str) -> str:
+        """Возвращает человекочитаемое описание исхода диалога."""
+        messages = {
+            "success": "success — контрагент согласился и прислал ShopList",
+            "timeout": "timeout — не получен ответ от контрагента",
+            "round_limit": "round_limit — исчерпан лимит раундов",
+            "refused": "refused — контрагент отказался от переговоров",
+            "error": "error — некорректный формат или неожиданный performative",
+            "incomplete": "incomplete — диалог завершился без результата",
+        }
+        return messages.get(outcome, outcome)
 
     async def _generate_and_save_impression(self):
         """Generate trust impression about contragent via LLM and persist it."""
@@ -432,6 +455,9 @@ class StartDialogueBehaviour(ContextBehaviour):
 
             iteration += 1
 
+        if self._dialogue_outcome == "incomplete":
+            logger.info("Dialogue with %s ended without explicit outcome, marking as incomplete", self.contragent)
+
         await thread.close()
         self._save_dialogue()
         await self._generate_and_save_impression()
@@ -512,7 +538,6 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
                 except json.JSONDecodeError:
                     continue
         return {}
-
     def fix_act_json(self, data: dict) -> dict:
         """Исправляет структуру Act JSON при некорректных вложениях."""
         if not isinstance(data, dict):
