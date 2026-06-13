@@ -10,6 +10,8 @@ ACCEPT = "accept"
 REFUSE = "refuse"
 ACKNOWLEDGE = "acknowledge"
 FAILURE = "failure"
+TRUST_REQUEST = "trust_request"
+TRUST_OPINION = "trust_opinion"
 
 class Templates:
     @staticmethod
@@ -43,6 +45,14 @@ class Templates:
     @staticmethod
     def REFUSE() -> Template:
         return Template(metadata={PERFORMATIVE : REFUSE})
+
+    @staticmethod
+    def TRUST_REQUEST() -> Template:
+        return Template(metadata={PERFORMATIVE : TRUST_REQUEST})
+
+    @staticmethod
+    def TRUST_OPINION() -> Template:
+        return Template(metadata={PERFORMATIVE : TRUST_OPINION})
 
     @classmethod
     def from_thread(cls, thread):

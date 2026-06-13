@@ -6,6 +6,7 @@ from datetime import datetime
 
 import numpy as np
 
+from spade_llm import consts
 from spade_llm.core.agent import Agent
 from spade_llm.core.behaviors import MessageHandlingBehavior, MessageTemplate
 from spade_llm.core.conf import Configurable, configuration
@@ -15,8 +16,15 @@ from spade_llm.demo.platform.auction.models import (
     ProposalBoardAgentConf,
     ShopList,
     ShopListRequest,
+    SystemTrustReview,
+    TrustFeedback,
+    TrustScoreRequest,
 )
 from spade_llm.demo.platform.auction.scenario_loader import get_active_scenario
+from spade_llm.demo.platform.auction.trust_mechanism import (
+    SystemTrustMechanism,
+    build_trust_score_response,
+)
 from spade_llm.demo.platform.auction.utils import user_decision
 
 logger = logging.getLogger(__name__)
@@ -26,6 +34,7 @@ logger = logging.getLogger(__name__)
 class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
     """Agent managing the auction proposal board"""
     proposal_board = ProposalBoard(agents=[], proposal=ShopList(), sku_request=ShopListRequest())
+    system_trust: SystemTrustMechanism = SystemTrustMechanism()
 
     def _save_winning_bid_split(self):
         """Save the bid_ingredient_split of the winning proposal to a file in dialogue-like format"""
@@ -208,10 +217,64 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             if msg:
                 await self.context.reply_with_inform(msg).with_content(self.agent.proposal_board)
 
+    class TrustScoreRequestBehaviour(MessageHandlingBehavior):
+        """Handles trust score requests for the platform board."""
+
+        def __init__(self, config: ProposalBoardAgentConf):
+            super().__init__(MessageTemplate.trust_request())
+            self.config = config
+
+        async def step(self):
+            msg = self.message
+            if not msg:
+                return
+            try:
+                req = TrustScoreRequest.model_validate_json(msg.content)
+                response = build_trust_score_response(self.agent.system_trust, req.target_agent)
+                await self.context.reply_with_inform(msg).with_content(response.model_dump_json())
+            except Exception as e:
+                logger.warning("Failed to handle trust request: %s", e)
+                await self.context.reply_with_failure(msg).with_content(str(e))
+
+    class TrustOpinionBehaviour(MessageHandlingBehavior):
+        """Handles trust opinions (reviews) for the platform board."""
+
+        def __init__(self, config: ProposalBoardAgentConf):
+            super().__init__(MessageTemplate.trust_opinion())
+            self.config = config
+
+        async def step(self):
+            msg = self.message
+            if not msg:
+                return
+            try:
+                feedback = TrustFeedback.model_validate_json(msg.content)
+                self.agent.system_trust.add_review(
+                    SystemTrustReview(
+                        reviewer_id=feedback.reviewer_id,
+                        target_agent=feedback.target_agent,
+                        rating=feedback.rating,
+                        comment=feedback.comment,
+                        outcome=feedback.outcome,
+
+                    )
+                )
+                if self.config.trust_board_persist:
+                    self.agent.system_trust.save(self.config.trust_board_path)
+                await self.context.reply_with_acknowledge(msg).with_content("")
+            except Exception as e:
+                logger.warning("Failed to handle trust opinion: %s", e)
+                await self.context.reply_with_failure(msg).with_content(str(e))
+
     def setup(self):
         """Initialize agent behaviors"""
         scenario = get_active_scenario()
         self.config.max_price = scenario.max_price
         logger.info("ProposalBoardAgent loaded scenario '%s', max_price set to %d", scenario.name, scenario.max_price)
+        if self.config.system_trust_enabled:
+            self.system_trust.load(self.config.trust_board_path)
+            logger.info("System trust board enabled, loaded from %s", self.config.trust_board_path)
         self.add_behaviour(self.InitialRequestBehaviour(self.config))
         self.add_behaviour(self.RequestInfoBehaviour(self.config))
+        self.add_behaviour(self.TrustScoreRequestBehaviour(self.config))
+        self.add_behaviour(self.TrustOpinionBehaviour(self.config))

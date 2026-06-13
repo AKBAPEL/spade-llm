@@ -81,6 +81,23 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
                 result.append((response.sender.agent_type, prop))
         return result
 
+    def _has_low_system_rating(self, proposal: AuctionProposal) -> bool:
+        """Check if any author of the proposal has a low system trust rating."""
+        config = self.agent.config
+        if not getattr(config, "system_trust_enabled", False):
+            return False
+        system_trust = self.agent.system_trust
+        threshold = getattr(config, "trust_reject_threshold", 2.0)
+        min_reviews = getattr(config, "min_reviews_for_reject", 5)
+        for author in proposal.authors:
+            if system_trust.is_low_score(author, threshold=threshold, min_reviews=min_reviews):
+                logger.info(
+                    "Rejecting proposal from %s: agent %s has low system rating",
+                    proposal.authors, author,
+                )
+                return True
+        return False
+
     async def extract_winner_and_notify_losers(self, proposals: List[tuple[str, AuctionProposal]]) -> Optional[ShopList]:
         """Select the winning proposal and notify losers"""
         if not proposals:
@@ -89,33 +106,41 @@ class AuctionContractNetInitiatorBehavior(ContextBehaviour):
         winner_sender = None
         winner = None
         for sender, proposal in proposals:
-            if winner is None:
-                current_supply = set(self.agent.proposal_board.proposal.ingredients.keys()).intersection(
-                    set(self.agent.proposal_board.sku_request.ingredients)
-                )
-                proposed_supply = set(proposal.prop.ingredients.keys()).intersection(
-                    set(self.agent.proposal_board.sku_request.ingredients)
-                )
-
-                if not current_supply.issubset(proposed_supply):
-                    logger.info("Missing ingredients from current best. Refusing")
-                    await self.context.refuse(sender).with_content('')
-                elif len(proposed_supply) > len(current_supply) or (
-                        len(proposed_supply) == len(current_supply) and
-                        sum(proposal.prop.ingredients.values()) < sum(
-                    self.agent.proposal_board.proposal.ingredients.values())
-                ):
-                    logger.info("Better coverage or lower price. Accepting")
-                    winner = proposal
-                    winner_sender = sender
-                    self.agent.proposal_board.proposal = winner.prop
-                    self.agent.proposal_board.agents = winner.authors
-                    self.agent.proposal_board.bid_ingredient_split = winner.bid_ingredient_split
-                    await self.context.accept(sender).with_content('')
-                else:
-                    logger.info("Not better, rejecting")
-                    await self.context.refuse(sender).with_content('')
-            else:
+            if winner is not None:
                 logger.info("Already updated board. Refusing")
                 await self.context.refuse(sender).with_content('UPDATING')
+                continue
+
+            if self._has_low_system_rating(proposal):
+                logger.info("Proposal from %s rejected due to low system trust rating", proposal.authors)
+                await self.context.refuse(sender).with_content(
+                    "Ставка отклонена: один или несколько авторов имеют низкий системный рейтинг доверия."
+                )
+                continue
+
+            current_supply = set(self.agent.proposal_board.proposal.ingredients.keys()).intersection(
+                set(self.agent.proposal_board.sku_request.ingredients)
+            )
+            proposed_supply = set(proposal.prop.ingredients.keys()).intersection(
+                set(self.agent.proposal_board.sku_request.ingredients)
+            )
+
+            if not current_supply.issubset(proposed_supply):
+                logger.info("Missing ingredients from current best. Refusing")
+                await self.context.refuse(sender).with_content('')
+            elif len(proposed_supply) > len(current_supply) or (
+                    len(proposed_supply) == len(current_supply) and
+                    sum(proposal.prop.ingredients.values()) < sum(
+                self.agent.proposal_board.proposal.ingredients.values())
+            ):
+                logger.info("Better coverage or lower price. Accepting")
+                winner = proposal
+                winner_sender = sender
+                self.agent.proposal_board.proposal = winner.prop
+                self.agent.proposal_board.agents = winner.authors
+                self.agent.proposal_board.bid_ingredient_split = winner.bid_ingredient_split
+                await self.context.accept(sender).with_content('')
+            else:
+                logger.info("Not better, rejecting")
+                await self.context.refuse(sender).with_content('')
         return winner.prop if winner else self.agent.proposal_board.proposal

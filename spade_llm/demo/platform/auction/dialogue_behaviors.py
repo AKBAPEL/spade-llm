@@ -16,6 +16,7 @@ from spade_llm.demo.platform.auction.agent_prompts import (
     DIALOGUE_INITIATOR_PROMPT,
     DIALOGUE_RESPONDER_PROMPT,
     NEGOTIATION_DECISION_PROMPT,
+    SYSTEM_TRUST_REVIEW_PROMPT,
     TRUST_IMPRESSION_PROMPT,
 )
 from spade_llm.demo.platform.auction.models import (
@@ -25,7 +26,9 @@ from spade_llm.demo.platform.auction.models import (
     NegotiationResponse,
     ShopList,
     ShopListRequest,
+    TrustFeedback,
 )
+from spade_llm.demo.platform.auction.trust_mechanism import TrustReviewBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,7 @@ class StartDialogueBehaviour(ContextBehaviour):
         self.user_request = user_request
         self.user_max_price = user_max_price
         self._dialogue_outcome = "incomplete"
+        self.partner_trust_score_context = "Информация о доверии к партнёру недоступна."
 
     # -----------------------
     # JSON УТИЛИТЫ
@@ -197,7 +201,8 @@ class StartDialogueBehaviour(ContextBehaviour):
             "current_interaction_data": str(interaction_data["data"]),
             "format_instructions": self.parser.get_format_instructions(),
             "user_max_price": self.user_max_price,
-            "user_request": self.user_request.model_dump_json()  # Для LLM
+            "user_request": self.user_request.model_dump_json(),
+            "partner_trust_score": self.partner_trust_score_context,
         })
 
         cleaned = self.clean_json(answer.content)
@@ -280,6 +285,14 @@ class StartDialogueBehaviour(ContextBehaviour):
     async def step(self):
         """Основной процесс инициации диалога"""
         logger.info("Starting dialogue with %s", self.contragent)
+
+        # Fetch combined trust context for the partner before starting the dialogue
+        if getattr(self.agent.config, 'enable_system_trust', False) or getattr(self.agent.config, 'enable_personal_trust', False):
+            try:
+                self.partner_trust_score_context = await self.agent.get_partner_trust_context(self.contragent, self)
+            except Exception as e:
+                logger.warning("Failed to fetch partner trust context for %s: %s", self.contragent, e)
+
         thread = await self.context.fork_thread()
         max_iterations = 10
         iteration = 0
@@ -422,7 +435,36 @@ class StartDialogueBehaviour(ContextBehaviour):
         await thread.close()
         self._save_dialogue()
         await self._generate_and_save_impression()
+        await self._submit_system_trust_review()
         self.set_is_done()
+
+    async def _submit_system_trust_review(self):
+        """Submit a system trust review about the contragent after the dialogue."""
+        if not getattr(self.agent.config, 'enable_system_trust', False):
+            return
+        try:
+            builder = TrustReviewBuilder(self.model, SYSTEM_TRUST_REVIEW_PROMPT)
+            review = await builder.build_review(
+                conversation_history=self.full_conversation_history,
+                agent_role=self.context.agent_type,
+                partner_id=self.contragent,
+                outcome=self._dialogue_outcome,
+                personal_impression=self.agent.get_latest_impression(self.contragent),
+            )
+            feedback = TrustFeedback(
+                reviewer_id=self.context.agent_type,
+                target_agent=self.contragent,
+                rating=review.rating,
+                comment=review.comment,
+                outcome=review.outcome,
+            )
+            await self.context.trust_opinion("proposal_board").with_content(feedback.model_dump_json())
+            logger.info(
+                "Submitted system trust review from %s about %s: %d★ %s",
+                self.context.agent_type, self.contragent, review.rating, review.comment
+            )
+        except Exception as e:
+            logger.warning("Failed to submit system trust review from %s about %s: %s", self.context.agent_type, self.contragent, e)
 
 
 class DialogueResponderBehaviour(MessageHandlingBehavior):
@@ -438,6 +480,9 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
         self.merchant_prompt = prompt or DIALOGUE_RESPONDER_PROMPT
         self.user_requests: Dict[str, ShopListRequest] = {}  # conversation_id -> запрос
         self._negotiation_decisions: Dict[str, NegotiationResponse] = {}  # conversation_id -> решение о переговорах
+        self._partner_trust_contexts: Dict[str, str] = {}  # conversation_id -> trust context string
+        self._last_partner_trust_context: str = "Информация о доверии к партнёру недоступна."
+        self._dialogue_outcomes: Dict[str, str] = {}  # conversation_id -> outcome
 
     # -----------------------
     # JSON УТИЛИТЫ
@@ -522,16 +567,18 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
     async def _should_negotiate(self, sender_id: str) -> NegotiationResponse:
         """Спрашивает LLM, хочет ли агент вступить в переговоры с отправителем."""
         parser = PydanticOutputParser(pydantic_object=NegotiationResponse)
-        impression = "Прошлого опыта взаимодействия нет. Это первая встреча."
-        if getattr(self.agent.config, 'enable_trust_mechanism', False):
-            latest = self.agent.get_latest_impression(sender_id)
-            if latest:
-                impression = latest
+        partner_trust_score = "Информация о доверии к партнёру недоступна."
+        if getattr(self.agent.config, 'enable_system_trust', False) or getattr(self.agent.config, 'enable_personal_trust', False):
+            try:
+                partner_trust_score = await self.agent.get_partner_trust_context(sender_id, self)
+            except Exception as e:
+                logger.warning("Failed to fetch partner trust context for %s: %s", sender_id, e)
+        self._last_partner_trust_context = partner_trust_score
         chain = NEGOTIATION_DECISION_PROMPT | self.model
         answer = await chain.ainvoke({
             "sender_id": sender_id,
             "shop_sku": self.agent.shop_sku,
-            "impression": impression,
+            "partner_trust_score": partner_trust_score,
             "format_instructions": parser.get_format_instructions()
         })
         cleaned = self.clean_json(answer.content)
@@ -544,7 +591,7 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
 
     async def _generate_and_save_impression_responder(self, partner_id: str, conversation_id: str, outcome: str):
         """Generate trust impression about partner via LLM and persist it."""
-        if not getattr(self.agent.config, 'enable_trust_mechanism', False):
+        if not (getattr(self.agent.config, 'enable_personal_trust', False) or getattr(self.agent.config, 'enable_trust_mechanism', False)):
             return
         try:
             history = self.full_conversation_history.get(conversation_id, [])
@@ -558,10 +605,38 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             impression = answer.content.strip()
             if impression:
                 self.agent.add_trust_impression(partner_id, impression, outcome, source="runtime")
-                self.agent.save_trust_memory()
                 logger.info("Saved trust impression for %s about %s: %s", self.context.agent_type, partner_id, impression[:120])
         except Exception as e:
             logger.warning("Failed to generate trust impression for %s about %s: %s", self.context.agent_type, partner_id, e)
+
+    async def _submit_system_trust_review_responder(self, partner_id: str, conversation_id: str, outcome: str):
+        """Submit a system trust review about the initiator after the dialogue."""
+        if not getattr(self.agent.config, 'enable_system_trust', False):
+            return
+        try:
+            history = self.full_conversation_history.get(conversation_id, [])
+            builder = TrustReviewBuilder(self.model, SYSTEM_TRUST_REVIEW_PROMPT)
+            review = await builder.build_review(
+                conversation_history=history,
+                agent_role=self.context.agent_type,
+                partner_id=partner_id,
+                outcome=outcome,
+                personal_impression=self.agent.get_latest_impression(partner_id),
+            )
+            feedback = TrustFeedback(
+                reviewer_id=self.context.agent_type,
+                target_agent=partner_id,
+                rating=review.rating,
+                comment=review.comment,
+                outcome=review.outcome,
+            )
+            await self.context.trust_opinion("proposal_board").with_content(feedback.model_dump_json())
+            logger.info(
+                "Submitted system trust review from %s about %s: %d★ %s",
+                self.context.agent_type, partner_id, review.rating, review.comment
+            )
+        except Exception as e:
+            logger.warning("Failed to submit system trust review from %s about %s: %s", self.context.agent_type, partner_id, e)
 
     # -----------------------
     # ГЛАВНАЯ ЛОГИКА
@@ -575,7 +650,8 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             "current_interaction_type": interaction_data["type"],
             "current_interaction_data": str(interaction_data["data"]),
             "format_instructions": self.parser.get_format_instructions(),
-            "user_request": self.user_requests[conversation_id].model_dump_json()
+            "user_request": self.user_requests[conversation_id].model_dump_json(),
+            "partner_trust_score": self._partner_trust_contexts.get(conversation_id, "Информация о доверии к партнёру недоступна."),
         })
 
         cleaned = self.clean_json(answer.content)
@@ -605,12 +681,15 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
                 )
                 await self.context.reply_with_refuse(msg).with_content(negotiation_decision.reason)
                 await self._generate_and_save_impression_responder(msg.sender.agent_type, conversation_id, "refused")
+                await self._submit_system_trust_review_responder(msg.sender.agent_type, conversation_id, "refused")
                 return
             else:
                 logger.info(
                     "Agent %s agreed negotiation with %s: %s",
                     self.context.agent_type, msg.sender.agent_type, negotiation_decision.reason
                 )
+                # Store trust context used for negotiation decision for later prompts
+                self._partner_trust_contexts[conversation_id] = self._last_partner_trust_context or "Информация о доверии к партнёру недоступна."
 
         if conversation_id not in self.conversation_history.keys():
             self.conversation_history[conversation_id] = list()
@@ -648,6 +727,7 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
             logger.info("Dialogue round limit reached for %s, refusing further negotiation", conversation_id)
             await self.context.reply_with_refuse(msg).with_content("Достигнут лимит раундов переговоров")
             await self._generate_and_save_impression_responder(msg.sender.agent_type, conversation_id, "round_limit")
+            await self._submit_system_trust_review_responder(msg.sender.agent_type, conversation_id, "round_limit")
             return
 
         if current_interaction is None:
@@ -668,6 +748,7 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
                 act.action.model_dump_json()
             )
             await self._generate_and_save_impression_responder(msg.sender.agent_type, conversation_id, "success")
+            await self._submit_system_trust_review_responder(msg.sender.agent_type, conversation_id, "success")
             return
         elif isinstance(act.action, Conversate):
             await self.context.reply_with_acknowledge(msg).with_content(
@@ -678,3 +759,4 @@ class DialogueResponderBehaviour(MessageHandlingBehavior):
                 "Unexpected action type"
             )
             await self._generate_and_save_impression_responder(msg.sender.agent_type, conversation_id, "error")
+            await self._submit_system_trust_review_responder(msg.sender.agent_type, conversation_id, "error")

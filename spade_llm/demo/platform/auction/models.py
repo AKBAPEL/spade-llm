@@ -39,6 +39,11 @@ class ProposalBoardAgentConf(BaseModel):
     total_rounds: int = Field(default=3, description="Общее количество раундов аукциона")
     stable_limit: int = Field(default=3, description="Сколько раундов подряд должна держаться ставка для завершения")
     max_price: int = Field(default=1e9, description="Максимальная цена, которую готов заплатить пользователь")
+    system_trust_enabled: bool = Field(default=False, description="Enable platform/system trust board")
+    trust_reject_threshold: float = Field(default=2.0, description="Average rating below this rejects bids")
+    min_reviews_for_reject: int = Field(default=5, description="Minimum reviews before low rating triggers rejection")
+    trust_board_persist: bool = Field(default=True, description="Persist trust board to disk")
+    trust_board_path: str = Field(default="data/memory/system_trust_board.json", description="Path to persist trust board")
 
 
 class AuctionProposal(BaseModel):
@@ -97,3 +102,61 @@ class TrustImpressionRecord(BaseModel):
     impression: str = Field(description="The impression text")
     outcome: str = Field(description="Outcome of the dialogue: success, refused, round_limit, error, timeout, unknown/preload")
     source: str = Field(description="Source of the impression: runtime, preload")
+
+
+class SystemTrustReview(BaseModel):
+    """Single review on the platform trust board."""
+    reviewer_id: str = Field(description="Agent that left the review")
+    target_agent: str = Field(description="Agent being reviewed")
+    rating: int = Field(description="Rating from 1 to 5 stars", ge=1, le=5)
+    comment: str = Field(description="Short comment up to 30 characters about your conversation", max_length=30)
+    outcome: str = Field(description="Outcome of the dialogue: success, refused, round_limit, error, timeout")
+    timestamp: Optional[str] = Field(default=None, description="ISO timestamp of the review")
+
+
+class TrustScoreRequest(BaseModel):
+    """Request for a partner's trust score."""
+    target_agent: str = Field(description="Agent whose trust score is requested")
+
+
+class TrustScoreResponse(BaseModel):
+    """Trust score and recent reviews for a partner."""
+    target_agent: str = Field(description="Agent being reviewed")
+    average_rating: float = Field(description="Average rating from 1 to 5")
+    total_reviews: int = Field(description="Total number of reviews")
+    positive_count: int = Field(description="Number of positive reviews (4-5 stars)")
+    negative_count: int = Field(description="Number of negative reviews (1-3 stars)")
+    positive_reviews: List[SystemTrustReview] = Field(
+        default_factory=list,
+        description="Up to 5 most recent positive reviews (4-5 stars)"
+    )
+    negative_reviews: List[SystemTrustReview] = Field(
+        default_factory=list,
+        description="Up to 5 most recent negative reviews (1-3 stars)"
+    )
+
+
+class TrustFeedback(BaseModel):
+    """Feedback sent by a merchant after a dialogue."""
+    reviewer_id: str = Field(description="Agent that leaves the feedback")
+    target_agent: str = Field(description="Agent being reviewed")
+    rating: int = Field(description="Rating from 1 to 5 stars", ge=1, le=5)
+    comment: str = Field(description="Short comment up to 30 characters about your conversation", max_length=30)
+    outcome: str = Field(description="Outcome of the dialogue")
+
+
+class BaseMerchantAgentConf(BaseModel):
+    """Common configuration for all merchant agents."""
+    model: str = Field(description="Model name")
+    bid_delay: float = Field(default=1, description="Delay between bids")
+    enable_personal_trust: bool = Field(default=False, description="Enable personal trust memory")
+    enable_system_trust: bool = Field(default=False, description="Enable platform/system trust")
+    trust_preload_from_dialogues: bool = Field(default=False, description="Preload trust impressions from existing dialogue files")
+    personal_trust_path: Optional[str] = Field(default=None, description="Path to personal trust memory file")
+    system_trust_model: str = Field(default="max", description="Model used for generating system trust reviews")
+
+    def model_post_init(self, __context):
+        # Backward compatibility: old config files use enable_trust_mechanism
+        data = self.model_extra or {}
+        if "enable_trust_mechanism" in data and "enable_personal_trust" not in data:
+            self.enable_personal_trust = data["enable_trust_mechanism"]

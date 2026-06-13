@@ -381,6 +381,22 @@ class AgentContext(KeyValueStorage, ModelsProvider, MessageSender, metaclass=ABC
     def acknowledge(self, receiver: str) -> MessageBuilder:
         return self.create_message_builder(consts.ACKNOWLEDGE).to_agent(receiver)
 
+    @dispatch(AgentId)
+    def trust_request(self, receiver: AgentId) -> MessageBuilder:
+        return self.create_message_builder(consts.TRUST_REQUEST).to_agent(receiver)
+
+    @dispatch(str)
+    def trust_request(self, receiver: str) -> MessageBuilder:
+        return self.create_message_builder(consts.TRUST_REQUEST).to_agent(receiver)
+
+    @dispatch(AgentId)
+    def trust_opinion(self, receiver: AgentId) -> MessageBuilder:
+        return self.create_message_builder(consts.TRUST_OPINION).to_agent(receiver)
+
+    @dispatch(str)
+    def trust_opinion(self, receiver: str) -> MessageBuilder:
+        return self.create_message_builder(consts.TRUST_OPINION).to_agent(receiver)
+
     def reply_with_inform(self, message: Message) -> MessageBuilder:
         return self.create_message_builder(consts.INFORM).to_agent(message.sender)
 
@@ -398,6 +414,12 @@ class AgentContext(KeyValueStorage, ModelsProvider, MessageSender, metaclass=ABC
 
     def reply_with_propose(self, message: Message) -> MessageBuilder:
         return self.create_message_builder(consts.PROPOSE).to_agent(message.sender)
+
+    def reply_with_trust_request(self, message: Message) -> MessageBuilder:
+        return self.create_message_builder(consts.TRUST_REQUEST).to_agent(message.sender)
+
+    def reply_with_trust_opinion(self, message: Message) -> MessageBuilder:
+        return self.create_message_builder(consts.TRUST_OPINION).to_agent(message.sender)
 
 
 

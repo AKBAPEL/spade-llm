@@ -151,6 +151,20 @@ class MessageTemplate:
         """
         return cls(performative=consts.FAILURE)
 
+    @classmethod
+    def trust_request(cls) -> "MessageTemplate":
+        """
+        Returns a MessageTemplate for the TRUST_REQUEST message type.
+        """
+        return cls(performative=consts.TRUST_REQUEST)
+
+    @classmethod
+    def trust_opinion(cls) -> "MessageTemplate":
+        """
+        Returns a MessageTemplate for the TRUST_OPINION message type.
+        """
+        return cls(performative=consts.TRUST_OPINION)
+
     @staticmethod
     def from_agent(agent_type: str) -> Callable[[Message], bool]:
         def validator(msg: Message) -> bool:
