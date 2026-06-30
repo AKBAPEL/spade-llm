@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -24,7 +25,10 @@ class PersonalTrustMechanism:
 
     def __init__(self, agent_id: str, path: Optional[str] = None):
         self.agent_id = agent_id
-        self.path = path or f"data/memory/{agent_id}_trust_memory.json"
+        if path is None:
+            from spade_llm.demo.platform.auction.utils import get_artifacts_dir
+            path = str(get_artifacts_dir() / "data" / "memory" / f"{agent_id}_trust_memory.json")
+        self.path = path
         self.memory: Dict[str, List[TrustImpressionRecord]] = {}
         self.load()
 

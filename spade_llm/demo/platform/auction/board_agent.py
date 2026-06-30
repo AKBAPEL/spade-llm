@@ -3,6 +3,8 @@ import json
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
+from typing import Dict
 
 import numpy as np
 
@@ -25,7 +27,7 @@ from spade_llm.demo.platform.auction.trust_mechanism import (
     SystemTrustMechanism,
     build_trust_score_response,
 )
-from spade_llm.demo.platform.auction.utils import user_decision
+from spade_llm.demo.platform.auction.utils import get_mechanism, get_run_id, save_run_meta, user_decision
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +40,13 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
 
     def _save_winning_bid_split(self):
         """Save the bid_ingredient_split of the winning proposal to a file in dialogue-like format"""
-        os.makedirs("auction_logs", exist_ok=True)
+        from spade_llm.demo.platform.auction.utils import ensure_artifact_dirs
+
+        dirs = ensure_artifact_dirs()
+        auction_logs_dir = dirs["auction_logs"]
         timestamp = datetime.now().strftime("%d-%H-%M-%S-%f")
         filename = f"winning_bid_split_{timestamp}.txt"
-        path = os.path.join("auction_logs", filename)
+        path = auction_logs_dir / filename
 
         scenario = get_active_scenario()
         agent_shop_sku = {agent_id: cfg.sku for agent_id, cfg in scenario.agents.items()}
@@ -64,11 +69,13 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
             metric_1 = 0.0
 
         agent_margins = []
+        margins_pct: Dict[str, float] = {}
         for agent, ingredients in self.proposal_board.bid_ingredient_split.items():
             P_i = sum(ingredients.values())
             C_i = sum(agent_shop_sku.get(agent, {}).get(ingr, 0) for ingr in ingredients.keys())
             margin_i = (P_i - C_i) / (C_i if C_i > 0 else 1)
             agent_margins.append(margin_i)
+            margins_pct[agent] = margin_i * 100
 
         metric_2 = np.prod(agent_margins) if agent_margins else 0.0
         #####################################################
@@ -97,6 +104,26 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
                 f.write(f"Margin: {margin:.2f}%\n")
                 f.write("\n")
             f.write("=========================================\n")
+
+        # Машиночитаемая запись для агрегации и презентации
+        run_id = get_run_id()
+        record_path = auction_logs_dir / f"bid_record_{run_id}_{timestamp}.json"
+        record = {
+            "run_id": run_id,
+            "mechanism": get_mechanism(),
+            "timestamp": timestamp,
+            "agents": self.proposal_board.agents,
+            "v": V,
+            "p": total_P,
+            "c": total_C,
+            "metric_1": metric_1,
+            "metric_2": metric_2,
+            "margins_pct": margins_pct,
+            "splits": self.proposal_board.bid_ingredient_split,
+        }
+        with open(record_path, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        logger.info("Saved winning bid record to %s", record_path)
 
         logger.info("Saved winning bid_ingredient_split to %s", path)
 
@@ -270,7 +297,14 @@ class ProposalBoardAgent(Agent, Configurable[ProposalBoardAgentConf]):
         """Initialize agent behaviors"""
         scenario = get_active_scenario()
         self.config.max_price = scenario.max_price
-        logger.info("ProposalBoardAgent loaded scenario '%s', max_price set to %d", scenario.name, scenario.max_price)
+        logger.info("ProposalBoardAgent loaded scenario '%s', max_price set to %d", scenario.name, self.config.max_price)
+        save_run_meta({
+            "scenario": scenario.name,
+            "max_price": self.config.max_price,
+            "system_trust_enabled": self.config.system_trust_enabled,
+            "trust_reject_threshold": self.config.trust_reject_threshold,
+            "min_reviews_for_reject": self.config.min_reviews_for_reject,
+        })
         if self.config.system_trust_enabled:
             self.system_trust.load(self.config.trust_board_path)
             logger.info("System trust board enabled, loaded from %s", self.config.trust_board_path)

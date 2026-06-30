@@ -25,8 +25,8 @@
 python3 spade_llm/demo/platform/auction/count_metrics.py \
   --dialogues dialogues \
   --auction-logs auction_logs \
-  --output output/none \
-  --label none
+  --output output/without \
+  --label without
 ```
 Параметры:
 - `--dialogues` — папка с логами диалогов.
@@ -45,12 +45,11 @@ python3 spade_llm/demo/platform/auction/count_metrics.py \
 ### 3. Агрегация результатов по всем механизмам доверия
 После получения отчётов для всех настроек запустить:
 ```bash
-python spade_llm/demo/platform/auction/count_metrics.py \
+python3 spade_llm/demo/platform/auction/count_metrics.py \
   --aggregate \
   output/none/report_none.json \
-  output/personal/report_personal.json \
-  output/system/report_system.json \
-  output/personal_system/report_personal_system.json \
+  output/without/report_without.json \
+  output/all/report_all.json \
   --output output/aggregate
 ```
 Результат:
@@ -70,8 +69,11 @@ Opponent [agent] (ActionType): ...
 Для успешных диалогов (`outcome == success`) фиксируется номер раунда, на котором контрагент прислал `ShopList`.
 **Один раунд — это завершённый обмен сообщениями: одно сообщение от каждого агента.**
 Номер раунда равен порядковому номеру сообщения согласия, делённому на 2.
-Неудачные исходы (`timeout`, `round_limit`, `refused`, `error`, `incomplete`) группируются в отдельный столбец `fail`.
-На графике указывается процент неудачных диалогов.
+
+Отказ от переговоров (`refused`) выделяется отдельным золотым столбцом `refused` — это осознанное решение контрагента, которое экономит токены, а не неудача.
+
+Неудачные исходы (`timeout`, `round_limit`, `error`, `incomplete`) группируются в столбец `fail`.
+На графике указывается процент refused и процент неудачных диалогов.
 
 ### 3. Количество успешных покупок пользователя
 Равно количеству файлов `winning_bid_split_*.txt`.
@@ -93,6 +95,7 @@ Opponent [agent] (ActionType): ...
 - `success_rate` — доля успешных диалогов (`successful_dialogues / (initiated + received)`).
 - `avg_dialogue_length` — средняя длина диалогов с участием агента.
 - `refused_negotiations` — число случаев, когда агент отказался от переговоров как контрагент.
+- `refusal_rate` — доля отказов среди полученных предложений (`refused_negotiations / received_dialogues`).
 
 ## Формат отчёта JSON
 ```json
@@ -100,10 +103,15 @@ Opponent [agent] (ActionType): ...
   "label": "none",
   "global": {
     "avg_dialogue_length": 5.2,
+    "avg_length_success": 6.5,
+    "avg_length_refused": 1.2,
+    "avg_length_failed": 8.1,
     "total_dialogues": 42,
-    "successful_dialogues": 28,
-    "failed_dialogues": 14,
-    "failure_rate": 0.333,
+    "successful_dialogues": 24,
+    "refused_dialogues": 8,
+    "failed_dialogues": 10,
+    "refused_rate": 0.19,
+    "failure_rate": 0.238,
     "successful_user_purchases": 10,
     "avg_agent_margin_pct": 7.5,
     "avg_v": 850,
@@ -119,7 +127,8 @@ Opponent [agent] (ActionType): ...
       "successful_dialogues": 15,
       "success_rate": 0.68,
       "avg_dialogue_length": 4.9,
-      "refused_negotiations": 3
+      "refused_negotiations": 3,
+      "refusal_rate": 0.3
     }
   }
 }
@@ -129,3 +138,4 @@ Opponent [agent] (ActionType): ...
 - Диалоги и победные ставки не сопоставляются жёстко по времени: метрики считаются независимо по множествам логов.
 - Если `auction_logs/` пуста, метрики 3 и 4 равны нулю, но метрики 1, 2 и 5 всё равно считаются.
 - Для повторных аукционов (после отказа пользователя) создаётся новый набор диалогов, но winning_bid_split появляется только при финальном успехе.
+- `refused` — это не неудача диалога, а решение контрагента не вступать в переговоры. В отчёте refused учитывается отдельно.

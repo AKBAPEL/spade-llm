@@ -1,0 +1,74 @@
+# Конфиг аукциона: механизм доверия отключён (none)
+# Использование:
+#   export AUCTION_MECHANISM=none
+#   python3 -m spade_llm.boot demo/platform/auction/configs/config_none.yaml
+
+messaging:
+  type_name: spade_llm.core.messaging.DictionaryMessageService
+storage:
+  type_name: spade_llm.core.storage.InMemoryStorageFactory
+scenario: scenario_a
+chat_models:
+  max:
+    type_name: spade_llm.models.gigachat.GigaChatModelFactory
+    args:
+      credentials: env.GIGA_CRED
+      scope: env.GIGACHAT_SCOPE
+      model: GigaChat-2-Max
+      verify_ssl_certs: False
+agents:
+  proposal_board:
+    type_name: spade_llm.demo.platform.auction.agents.ProposalBoardAgent
+    args:
+      total_rounds: 3
+      stable_limit: 3
+      max_price: 750
+      system_trust_enabled: false
+      trust_reject_threshold: 2.0
+      min_reviews_for_reject: 5
+      trust_board_persist: false
+      trust_board_path: "artifacts/data/memory/system_trust_board.json"
+  first_merchant:
+    type_name: spade_llm.demo.platform.auction.agents.FirstMerchantAgent
+    args:
+      model: max
+      enable_personal_trust: false
+      enable_system_trust: false
+      system_trust_model: max
+  second_merchant:
+    type_name: spade_llm.demo.platform.auction.agents.SecondMerchantAgent
+    args:
+      model: max
+      enable_personal_trust: false
+      enable_system_trust: false
+      system_trust_model: max
+  third_merchant:
+    type_name: spade_llm.demo.platform.auction.agents.ThirdMerchantAgent
+    args:
+      model: max
+      enable_personal_trust: false
+      enable_system_trust: false
+      system_trust_model: max
+  fourth_merchant:
+    type_name: spade_llm.demo.platform.auction.agents.FourthMerchantAgent
+    args:
+      model: max
+      enable_personal_trust: false
+      enable_system_trust: false
+      system_trust_model: max
+  fifth_merchant:
+    type_name: spade_llm.demo.platform.auction.agents.FifthMerchantAgent
+    args:
+      model: max
+      enable_personal_trust: false
+      enable_system_trust: false
+      system_trust_model: max
+  console:
+    type_name: spade_llm.agents.console.ConsoleAgent
+    args:
+      delegate_type: proposal_board
+      prompt: Нажмите Enter
+      timeout: 200
+  df:
+    type_name: spade_llm.demo.platform.contractnet.discovery.DirectoryFacilitatorAgent
+wait_for_agents: [ console ]

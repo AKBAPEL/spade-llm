@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -29,6 +30,7 @@ from spade_llm.demo.platform.auction.models import (
     TrustFeedback,
 )
 from spade_llm.demo.platform.auction.trust_mechanism import TrustReviewBuilder
+from spade_llm.demo.platform.auction.utils import get_mechanism, get_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,7 @@ class StartDialogueBehaviour(ContextBehaviour):
         self.user_request = user_request
         self.user_max_price = user_max_price
         self._dialogue_outcome = "incomplete"
+        self._refusal_reason: Optional[str] = None
         self.partner_trust_score_context = "Информация о доверии к партнёру недоступна."
 
     # -----------------------
@@ -131,10 +134,13 @@ class StartDialogueBehaviour(ContextBehaviour):
 
     def _save_dialogue(self):
         """Сохраняет историю диалога в файл с указанием ролей и итогового статуса"""
-        os.makedirs("dialogues", exist_ok=True)
-        timestamp = datetime.now().strftime("%d-%H-%M-%S-%f")
-        filename = f"dialogue_start_{timestamp}.txt"
-        path = os.path.join("dialogues", filename)
+        from spade_llm.demo.platform.auction.utils import ensure_artifact_dirs
+
+        dirs = ensure_artifact_dirs()
+        dialogues_dir = dirs["dialogues"]
+        self._dialogue_timestamp = datetime.now().strftime("%d-%H-%M-%S-%f")
+        filename = f"dialogue_start_{self._dialogue_timestamp}.txt"
+        path = dialogues_dir / filename
 
         outcome_text = self._outcome_message(self._dialogue_outcome)
 
@@ -150,7 +156,7 @@ class StartDialogueBehaviour(ContextBehaviour):
             return "Unknown", content
 
         with open(path, "w", encoding="utf-8") as f:
-            f.write(f"=== Dialogue log started at {timestamp} ===\n")
+            f.write(f"=== Dialogue log started at {self._dialogue_timestamp} ===\n")
             f.write(f"Initiator agent: {self.context.agent_type}\n")
             f.write(f"Contragent agent: {self.contragent}\n")
             f.write(f"Roles: {self.context.agent_type} = покупатель (инициатор), {self.contragent} = продавец (контрагент)\n")
@@ -178,6 +184,86 @@ class StartDialogueBehaviour(ContextBehaviour):
             f.write(f"\n=== Outcome: {outcome_text} ===\n")
 
         logger.info("Saved dialogue to %s", path)
+
+    def _save_dialogue_record(self, system_review: Optional[Dict] = None):
+        """Сохраняет машиночитаемую запись о диалоге для анализа и презентации."""
+        from spade_llm.demo.platform.auction.utils import ensure_artifact_dirs
+
+        dirs = ensure_artifact_dirs()
+        dialogues_dir = dirs["dialogues"]
+        timestamp = getattr(self, "_dialogue_timestamp", datetime.now().strftime("%d-%H-%M-%S-%f"))
+        run_id = get_run_id()
+        filename = f"dialogue_record_{run_id}_{timestamp}.json"
+        path = dialogues_dir / filename
+
+        def parse_message(entry: str):
+            try:
+                role, content = entry.split(": ", 1)
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError:
+                    data = {}
+                if "offer" in data:
+                    msg_type = "Conversate"
+                    display = data["offer"]
+                elif "ingredients" in data:
+                    msg_type = "ShopList"
+                    display = str(data["ingredients"])
+                else:
+                    msg_type = "Unknown"
+                    display = content
+
+                if role.lower() == "self":
+                    agent_type = self.context.agent_type
+                else:
+                    agent_type = self.contragent
+
+                return {
+                    "role": role,
+                    "agent": agent_type,
+                    "type": msg_type,
+                    "content": display,
+                }
+            except Exception:
+                return {"role": "ParseError", "agent": "", "type": "Unknown", "content": entry}
+
+        messages = [parse_message(e) for e in self.full_conversation_history]
+
+        agreement_round = None
+        for idx, msg in enumerate(messages, start=1):
+            if msg["role"] == "Opponent" and msg["type"] == "ShopList":
+                agreement_round = idx // 2
+                break
+
+        negotiation_decision = None
+        if self._dialogue_outcome == "refused" and self._refusal_reason is not None:
+            negotiation_decision = {"agree": False, "reason": self._refusal_reason}
+        elif self._dialogue_outcome != "refused":
+            negotiation_decision = {"agree": True, "reason": ""}
+
+        personal_impression = None
+        if getattr(self.agent, "get_latest_impression", None):
+            personal_impression = self.agent.get_latest_impression(self.contragent)
+
+        record = {
+            "run_id": run_id,
+            "mechanism": get_mechanism(),
+            "timestamp": timestamp,
+            "initiator": self.context.agent_type,
+            "contragent": self.contragent,
+            "outcome": self._dialogue_outcome,
+            "length": len(messages),
+            "agreement_round": agreement_round,
+            "messages": messages,
+            "negotiation_decision": negotiation_decision,
+            "trust_context_used": self.partner_trust_score_context,
+            "personal_impression": personal_impression,
+            "system_review": system_review,
+        }
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        logger.info("Saved dialogue record to %s", path)
 
     def _outcome_message(self, outcome: str) -> str:
         """Возвращает человекочитаемое описание исхода диалога."""
@@ -352,6 +438,7 @@ class StartDialogueBehaviour(ContextBehaviour):
             if response.performative == consts.REFUSE:
                 logger.info("Contragent %s refused negotiation. Reason: %s", self.contragent, response.content)
                 self._dialogue_outcome = "refused"
+                self._refusal_reason = response.content or ""
                 break
 
             if response.performative != consts.ACKNOWLEDGE:
@@ -461,13 +548,14 @@ class StartDialogueBehaviour(ContextBehaviour):
         await thread.close()
         self._save_dialogue()
         await self._generate_and_save_impression()
-        await self._submit_system_trust_review()
+        system_review = await self._submit_system_trust_review()
+        self._save_dialogue_record(system_review=system_review)
         self.set_is_done()
 
-    async def _submit_system_trust_review(self):
+    async def _submit_system_trust_review(self) -> Optional[Dict]:
         """Submit a system trust review about the contragent after the dialogue."""
         if not getattr(self.agent.config, 'enable_system_trust', False):
-            return
+            return None
         try:
             builder = TrustReviewBuilder(self.model, SYSTEM_TRUST_REVIEW_PROMPT)
             review = await builder.build_review(
@@ -489,8 +577,17 @@ class StartDialogueBehaviour(ContextBehaviour):
                 "Submitted system trust review from %s about %s: %d★ %s",
                 self.context.agent_type, self.contragent, review.rating, review.comment
             )
+            return {
+                "reviewer_id": review.reviewer_id,
+                "target_agent": review.target_agent,
+                "rating": review.rating,
+                "comment": review.comment,
+                "outcome": review.outcome,
+                "timestamp": review.timestamp,
+            }
         except Exception as e:
             logger.warning("Failed to submit system trust review from %s about %s: %s", self.context.agent_type, self.contragent, e)
+            return None
 
 
 class DialogueResponderBehaviour(MessageHandlingBehavior):
